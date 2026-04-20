@@ -3,6 +3,14 @@
 
 ---
 
+## My Setup
+
+I use a Growatt inverter for my solar array and a Deye inverter for the batteries. 
+The battries are not connected when you set this up, that has to be done depending on your setup.
+The value of the state of charge is named in this setup but you have to adjust the enity to your needs. Some nodes are not set correctly because typical values are needed from Home Assistent, they are marked red afte rimport.
+
+---
+
 ## Prerequisites
 
 Install in Node-RED via **Manage palette**:
