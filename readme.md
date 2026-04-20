@@ -245,4 +245,249 @@ Create an HA automation that reads the three output entities and sends commands 
 
 ```yaml
 automation:
-  -
+  - alias: "EMS Battery Charge"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.battery_charging
+      - platform: state
+        entity_id: input_number.battery_dc_amps
+    action:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.battery_charging
+                state: "on"
+            sequence:
+              - service: YOUR_BATTERY_INTEGRATION.set_charge_current
+                data:
+                  amps: "{{ states('input_number.battery_dc_amps') | int }}"
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.battery_charging
+                state: "off"
+            sequence:
+              - service: YOUR_BATTERY_INTEGRATION.stop_charging
+
+  - alias: "EMS Battery Discharge"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.battery_discharging
+      - platform: state
+        entity_id: input_number.battery_dc_amps
+    action:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.battery_discharging
+                state: "on"
+            sequence:
+              - service: YOUR_BATTERY_INTEGRATION.set_discharge_current
+                data:
+                  amps: "{{ states('input_number.battery_dc_amps') | int }}"
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.battery_discharging
+                state: "off"
+            sequence:
+              - service: YOUR_BATTERY_INTEGRATION.stop_discharging
+```
+
+---
+
+## How It Works
+
+### Decision Priority
+
+Each cycle the EMS evaluates conditions in this order — the first matching condition wins:
+
+1. **Negative price** — charge at maximum grid headroom, being paid to consume
+2. **Critical SoC** — SoC below 20% and price below average, charge at max regardless of planner
+3. **Planner charge window** — current hour is one of today's cheapest, charge from grid
+4. **Solar surplus** — exporting more than 500 W, absorb into battery (free energy, always wins)
+5. **High price / discharge window** — peak price hour, discharge to cover import
+6. **Idle** — no action
+
+### Charge Window Planning
+
+The Price Planner calculates how many hours are needed to fill the battery:
+
+```
+hoursNeeded = ceil(kwhNeeded / maxChargeRate) + 1 buffer hour
+```
+
+It then selects the cheapest N hours from today's remaining hours plus tomorrow. The price cap depends on SoC:
+
+- **SoC ≥ 90%** — tight mode: only hours below 0.12 €/kWh qualify
+- **SoC < 90%** — expanded mode: any hour below today's average price qualifies
+
+This ensures a low battery will charge at more hours (accepting slightly higher prices) while a nearly full battery only charges at genuinely cheap moments.
+
+### Discharge Window Planning
+
+The planner identifies peak price hours using local maximum detection — an hour qualifies as a peak if its price is more than 0.008 €/kWh above both its neighbours. Shoulder hours (within 88% of the peak price) are also included. A morning fallback ensures at least one morning discharge hour is always selected.
+
+### Grid Headroom Protection
+
+The maximum charge rate is limited to prevent tripping the phase breaker:
+
+```
+headroom = GRID_MAX_A_PHASE - maxPhaseLoad - SAFETY_MARGIN
+maxChargeAmps = headroom × 230V × 3 phases ÷ 48V × 0.85 efficiency
+```
+
+With `GRID_MAX_A_PHASE = 18` and `SAFETY_MARGIN_A = 2`, the effective limit per phase is 16 A before the charger kicks in.
+
+### Discharge Targeting
+
+During high-price discharge, the target is **gross grid import** (not net), ensuring all importing phases are covered even when other phases are exporting solar. An export bias of 800 W is added to slightly over-discharge and guarantee zero import.
+
+---
+
+## Diagnostics
+
+The **EMS Diagnostics** debug node outputs a full payload each cycle. Key fields to watch:
+
+| Field | What to check |
+|---|---|
+| `version` | Confirms which script versions are running |
+| `reason` | Human-readable explanation of the current decision |
+| `planner.inWindow` | true = currently in a planned cheap charge hour |
+| `planner.inDischargeWindow` | true = currently in a planned peak discharge hour |
+| `planner.plannedHours` | Array of today's charge hours |
+| `planner.plannedDischargeHours` | Array of today's discharge hours |
+| `inputs.maxPhaseLoad_A` | Highest phase load — charge rate limited by this |
+| `inputs.worstHeadroom_A` | Available headroom before hitting phase limit |
+| `inputs.dischargeTarget_W` | Gross import being targeted for zero |
+
+### Node Status
+
+Both function nodes show a live status line in the flow editor canvas:
+
+**Price Planner:**
+```
+v2.4 CHG | SoC:84% cap:0.22 | dch>0.208EUR | hour 15h
+```
+
+**EMS Decision Engine:**
+```
+EMS v3.3 CHG 164A | SoC:84% | 0.126EUR | solar:8394W
+```
+
+---
+
+## Configuration Reference
+
+### Price Planner Settings
+
+Open the **Price Planner** function node and edit the variables at the top.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLANNER_VERSION` | `'v2.4'` | Version string — update when making changes |
+| `BATTERY_KWH` | `40` | Total battery capacity in kWh |
+| `BATTERY_VOLTAGE` | `48` | Nominal DC voltage |
+| `MAX_AMPS` | `200` | Hardware maximum charge current (A) |
+| `ROUND_TRIP_EFF` | `0.85` | Round-trip efficiency (85%) |
+| `SOC_MIN` | `10` | Absolute minimum SoC % |
+| `SOC_MAX` | `95` | Maximum SoC % |
+| `SAFETY_BUFFER_H` | `1` | Extra hours added to charge plan as safety buffer |
+| `DISCHARGE_ABS_MIN` | `0.19` | Never discharge below this price (€/kWh) |
+| `CHARGE_ABS_MAX` | `0.12` | Tight mode price cap (€/kWh) |
+| `SOC_NORMAL_THRESHOLD` | `90` | SoC % above which tight charge mode applies |
+
+### EMS Decision Engine Settings
+
+Open the **EMS Decision Engine** function node and edit the `CFG` block.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMS_VERSION` | `'EMS v3.3'` | Version string — update when making changes |
+| `MAX_AMPS` | `200` | Battery hardware limit (A DC) |
+| `BATTERY_VOLTAGE` | `48` | Nominal DC voltage |
+| `SOC_MIN` | `10` | Absolute minimum SoC — never discharge below |
+| `SOC_MAX` | `95` | Maximum SoC — never charge above |
+| `SOC_DISCHARGE_MIN` | `15` | Soft discharge floor in normal operation |
+| `SOC_CRITICAL` | `20` | Below this SoC%, charge at any below-average price |
+| `CHARGE_ABS_MAX` | `0.10` | Fallback charge threshold (no planner data) |
+| `DISCHARGE_ABS_MIN` | `0.12` | Minimum price for ratio-based discharge |
+| `DISCHARGE_OVERSHOOT` | `1.25` | Discharge 25% extra to guarantee zero import |
+| `EXPORT_BIAS_W` | `800` | Extra watts added to discharge target |
+| `HYSTERESIS` | `0.05` | Price ratio hysteresis to prevent oscillation |
+| `SOLAR_SURPLUS_W` | `500` | Minimum surplus (W) to start solar absorption |
+| `SOLAR_SURPLUS_EXIT_W` | `200` | Surplus (W) below which solar charging stops |
+| `ROUND_TRIP_EFF` | `0.85` | Round-trip efficiency |
+| `GRID_MAX_A_PHASE` | `18` | Safe maximum amps per phase |
+| `GRID_VOLTAGE` | `230` | AC grid voltage |
+| `SAFETY_MARGIN_A` | `2` | Safety buffer before headroom kicks in |
+| `MIN_DISCHARGE_A` | `35` | Minimum discharge to avoid micro-cycles |
+
+---
+
+## Tuning Guide
+
+### Battery charges too little / too late
+- Lower `SOC_NORMAL_THRESHOLD` (e.g. from 90 to 80) so expanded mode stays active longer
+- Raise `CHARGE_ABS_MAX` (e.g. from 0.12 to 0.15) so more hours qualify in tight mode
+- Lower `SAFETY_BUFFER_H` from 1 to 0 if the battery consistently ends charge windows with capacity to spare
+
+### Battery charges too aggressively at expensive prices
+- Raise `SOC_NORMAL_THRESHOLD` (e.g. to 95) so tight mode kicks in earlier
+- Lower `CHARGE_ABS_MAX` (e.g. to 0.08) to be more selective in tight mode
+
+### Battery discharges too early / at low prices
+- Raise `DISCHARGE_ABS_MIN` (e.g. from 0.19 to 0.22) to require a higher absolute price
+- The discharge window is based on today's price peaks — if prices are generally high, many hours may qualify. The 88% shoulder threshold can be raised to reduce window size
+
+### Battery discharges at wrong SoC level
+- Raise `SOC_DISCHARGE_MIN` (e.g. from 15 to 25) to keep more reserve
+- Raise `SOC_CRITICAL` (e.g. from 20 to 30) to trigger emergency charging earlier
+
+### Grid import still visible during discharge
+- Raise `EXPORT_BIAS_W` (e.g. from 800 to 1200)
+- Raise `DISCHARGE_OVERSHOOT` (e.g. from 1.25 to 1.35)
+
+### Phase breaker tripping during charge
+- Lower `GRID_MAX_A_PHASE` (e.g. from 18 to 16)
+- Raise `SAFETY_MARGIN_A` (e.g. from 2 to 4)
+
+### Solar surplus not being absorbed
+- Lower `SOLAR_SURPLUS_W` (e.g. from 500 to 300) to start absorbing at smaller surplus
+- Check that `sensor.battery_state_of_charge` is returning a valid value — if it defaults to 50, the SoC protection may be blocking charging incorrectly
+
+### Battery SoC jumping to wrong value
+- Verify `sensor.battery_state_of_charge` is updating correctly in HA
+- The planner caches the last SoC in Node-RED context — if the sensor is unavailable for a period, context will hold a stale value. Restart the flow to reset context.
+
+---
+
+## Updating Version Numbers
+
+Both scripts define a single version variable at the top. When you change settings, increment the version so you can confirm the new code is running:
+
+```javascript
+// Price Planner — line 6
+var PLANNER_VERSION = 'v2.5';
+
+// EMS Decision Engine — line 6
+var EMS_VERSION = 'EMS v3.4';
+```
+
+The version appears in the node status badge on the canvas, in the debug diagnostics output, and in the `version` field of every payload.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| All nodes show red (no connection) | HA server not configured | Open any node → pencil icon → configure server |
+| Entity not found in cache | HA websocket connection reset | Restart the HA server connection in Node-RED config nodes |
+| `Planner unknown` in version | Price planner not wired into the chain | Check wiring: `get-frank-prices → get-soc → price-planner → get-grid-import` |
+| `inWindow: undefined` | Old planner code — `msg.plannerVersion` set before window assignments | Replace planner with latest script |
+| Battery idle at cheap price | SoC above `SOC_NORMAL_THRESHOLD`, price above tight cap | Raise `SOC_NORMAL_THRESHOLD` or lower `CHARGE_ABS_MAX` |
+| Battery idle with solar surplus | `actualSurplusW` below threshold, or solar sensor returning 0 | Check Growatt PAC entities are updating |
+| Charging and discharging simultaneously | Template sensors both non-zero | Verify `battery_charging` and `battery_discharging` booleans are never both `on` |
+| Phase breaker tripping | Phase load + charger exceeds limit | Lower `GRID_MAX_A_PHASE` |
+| Grid import during discharge | Export bias too low | Raise `EXPORT_BIAS_W` |
+| SoC showing 50% always | BMS entity unavailable or wrong name | Replace `sensor.battery_state_of_charge` with correct entity |
+| Statistics graph shows no data | Entity missing `state_class` | Add `state_class: measurement` to template sensors |
