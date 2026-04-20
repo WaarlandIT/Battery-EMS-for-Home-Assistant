@@ -9,6 +9,8 @@ I use a Growatt inverter for my solar array and a Deye inverter for the batterie
 The battries are not connected when you set this up, that has to be done depending on your setup.
 The value of the state of charge is named in this setup but you have to adjust the enity to your needs. 
 
+I used Frank Energie because they have an open API and give you access to the actual sinus of the market pricing of energy in the Netherlands. Even if you use another energy provider these graphs are acurate for the price variations, they all use the same genral market value but adjust the sales price to their needs.  
+
 #### Some nodes are not set correctly because typical values are needed from Home Assistent, they are marked red after import.
 
 ---
