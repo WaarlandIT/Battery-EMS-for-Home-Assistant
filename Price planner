@@ -1,0 +1,267 @@
+// Price Planner
+// v2.3 - version defined as single variable at top
+// v2.2 - SOC_NORMAL_THRESHOLD raised to 80%
+// v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected to 0.19
+// v2.0 - DISCHARGE_ABS_MIN raised to 0.19, dischargeThreshold recalculated after conflict filter
+
+var PLANNER_VERSION = 'v2.5';
+var BATTERY_KWH = 40;
+var BATTERY_VOLTAGE = 48;
+var MAX_AMPS = 200;
+var ROUND_TRIP_EFF = 0.85;
+var SOC_MIN = 10;
+var SOC_MAX = 95;
+var SAFETY_BUFFER_H = 1;
+var SOC_NORMAL_THRESHOLD = 90;
+
+// Price thresholds as ratios of today's average — scales automatically with market prices
+// CHARGE_TIGHT_RATIO:    charge in tight mode only below this fraction of avg (SoC >= SOC_NORMAL_THRESHOLD)
+// CHARGE_EXPANDED_RATIO: charge in expanded mode below this fraction of avg (SoC < SOC_NORMAL_THRESHOLD)
+// DISCHARGE_MIN_RATIO:   only discharge above this fraction of avg
+var CHARGE_TIGHT_RATIO = 0.55;  // tight:    price <= 55% of avg
+var CHARGE_EXPANDED_RATIO = 0.99;  // expanded: price <= 99% of avg (below average)
+var DISCHARGE_MIN_RATIO = 0.85;  // discharge: price >= 85% of avg  // above this SoC use tight charge window
+
+var maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;
+
+var batterySoC = parseFloat(msg.batterySoC) || parseFloat(context.get('lastSoC')) || 50;
+context.set('lastSoC', batterySoC);
+
+var usableCapacity = BATTERY_KWH * ((SOC_MAX - SOC_MIN) / 100);
+var currentKwh = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);
+var kwhNeeded = Math.max(0, usableCapacity - currentKwh);
+var hoursNeeded = Math.ceil(kwhNeeded / maxChargeKw) + SAFETY_BUFFER_H;
+
+var prices = null;
+if (Array.isArray(msg.frankPrices)) {
+  prices = msg.frankPrices;
+} else if (msg.frankPrices && Array.isArray(msg.frankPrices.prices)) {
+  prices = msg.frankPrices.prices;
+}
+
+if (!prices || prices.length === 0) {
+  msg.plannerVersion = PLANNER_VERSION;
+  msg.inChargingWindow = null;
+  msg.inDischargeWindow = null;
+  msg.dischargeThreshold = null;
+  msg.plannedChargeHours = [];
+  msg.plannedDischargeHours = [];
+  msg.hoursNeeded = hoursNeeded;
+  msg.kwhNeeded = parseFloat(kwhNeeded.toFixed(2));
+  msg.cheapestPrice = null;
+  msg.plannerReason = 'No price schedule available - using ratio fallback';
+  node.status({ fill: 'yellow', shape: 'dot', text: PLANNER_VERSION + ' No price data - fallback mode' });
+  return msg;
+}
+
+var now = new Date();
+var nowMs = now.getTime();
+var localOffset = now.getTimezoneOffset() * 60000;
+var localNow = new Date(nowMs - localOffset);
+var localDateStr = localNow.toISOString().substring(0, 10);
+var currentHour = now.getHours();
+
+var allParsed = [];
+for (var i = 0; i < prices.length; i++) {
+  var p = prices[i];
+  var fromDate = new Date(p.from);
+  var tillDate = new Date(p.till);
+  allParsed.push({
+    from: fromDate,
+    till: tillDate,
+    price: parseFloat(p.price),
+    localHour: parseInt(p.from.substring(11, 13), 10),
+    dateStr: p.from.substring(0, 10)
+  });
+}
+
+var currentPriceCalc = null;
+var totalPrice = 0;
+var todayCount = 0;
+for (var cp = 0; cp < allParsed.length; cp++) {
+  if (allParsed[cp].dateStr === localDateStr) {
+    totalPrice += allParsed[cp].price;
+    todayCount++;
+    if (allParsed[cp].localHour === currentHour) {
+      currentPriceCalc = allParsed[cp].price;
+    }
+  }
+}
+var avgPriceCalc = todayCount > 0 ? totalPrice / todayCount : 0.10;
+
+// Calculate dynamic price thresholds from today's average
+var chargeAbsMax = avgPriceCalc * CHARGE_TIGHT_RATIO;
+var dischargeAbsMin = avgPriceCalc * DISCHARGE_MIN_RATIO;
+
+msg.currentPrice = currentPriceCalc !== null ? String(currentPriceCalc) : msg.currentPrice;
+msg.avgPrice = String(parseFloat(avgPriceCalc.toFixed(4)));
+
+var todayPrices = [];
+var tomorrowPrices = [];
+for (var t = 0; t < allParsed.length; t++) {
+  if (allParsed[t].dateStr === localDateStr) {
+    todayPrices.push(allParsed[t]);
+  } else {
+    tomorrowPrices.push(allParsed[t]);
+  }
+}
+
+var remainingToday = [];
+for (var r = 0; r < todayPrices.length; r++) {
+  if (todayPrices[r].till.getTime() > nowMs) {
+    remainingToday.push(todayPrices[r]);
+  }
+}
+
+var chargePriceCap = batterySoC >= SOC_NORMAL_THRESHOLD
+  ? chargeAbsMax
+  : avgPriceCalc * CHARGE_EXPANDED_RATIO;
+
+var planPrices = remainingToday.concat(tomorrowPrices);
+planPrices.sort(function (a, b) { return a.price - b.price; });
+
+var eligibleSlots = [];
+for (var e = 0; e < planPrices.length; e++) {
+  if (planPrices[e].price <= chargePriceCap) {
+    eligibleSlots.push(planPrices[e]);
+  }
+}
+var cheapestSlots = eligibleSlots.slice(0, hoursNeeded);
+var cheapestHours = [];
+for (var j = 0; j < cheapestSlots.length; j++) {
+  cheapestHours.push(cheapestSlots[j].localHour);
+}
+var inWindow = cheapestHours.indexOf(currentHour) !== -1;
+var cheapestPrice = planPrices.length > 0 ? planPrices[0].price : null;
+
+var fullCurve = todayPrices.concat(tomorrowPrices);
+fullCurve.sort(function (a, b) { return a.from.getTime() - b.from.getTime(); });
+
+var localPeaks = [];
+for (var n = 1; n < fullCurve.length - 1; n++) {
+  var prev = fullCurve[n - 1].price;
+  var curr = fullCurve[n].price;
+  var next = fullCurve[n + 1].price;
+  if (curr > prev + 0.008 && curr > next + 0.008) {
+    localPeaks.push(fullCurve[n].localHour + '_' + fullCurve[n].dateStr);
+  }
+}
+if (fullCurve.length >= 2) {
+  if (fullCurve[0].price > fullCurve[1].price + 0.008) {
+    localPeaks.push(fullCurve[0].localHour + '_' + fullCurve[0].dateStr);
+  }
+  var last = fullCurve.length - 1;
+  if (fullCurve[last].price > fullCurve[last - 1].price + 0.008) {
+    localPeaks.push(fullCurve[last].localHour + '_' + fullCurve[last].dateStr);
+  }
+}
+
+var expensiveHours = [];
+var dischargeThreshold = null;
+for (var d = 0; d < remainingToday.length; d++) {
+  var slot = remainingToday[d];
+  var slotKey = slot.localHour + '_' + slot.dateStr;
+  if (slot.price >= dischargeAbsMin && localPeaks.indexOf(slotKey) !== -1) {
+    expensiveHours.push(slot.localHour);
+    if (dischargeThreshold === null || slot.price < dischargeThreshold) {
+      dischargeThreshold = slot.price;
+    }
+  }
+}
+
+var highestPeakPrice = 0;
+for (var hp = 0; hp < expensiveHours.length; hp++) {
+  for (var hpc = 0; hpc < remainingToday.length; hpc++) {
+    if (remainingToday[hpc].localHour === expensiveHours[hp] && remainingToday[hpc].price > highestPeakPrice) {
+      highestPeakPrice = remainingToday[hpc].price;
+    }
+  }
+}
+var peakShoulderMin = highestPeakPrice * 0.88;
+for (var sh = 0; sh < remainingToday.length; sh++) {
+  var shSlot = remainingToday[sh];
+  if (shSlot.price >= peakShoulderMin && shSlot.price >= dischargeAbsMin) {
+    if (expensiveHours.indexOf(shSlot.localHour) === -1) {
+      expensiveHours.push(shSlot.localHour);
+      if (dischargeThreshold === null || shSlot.price < dischargeThreshold) {
+        dischargeThreshold = shSlot.price;
+      }
+    }
+  }
+}
+
+var hasMorningPeak = false;
+for (var mp = 0; mp < expensiveHours.length; mp++) {
+  if (expensiveHours[mp] >= 6 && expensiveHours[mp] <= 11) {
+    hasMorningPeak = true;
+    break;
+  }
+}
+if (!hasMorningPeak) {
+  var bestMorning = null;
+  for (var bm = 0; bm < remainingToday.length; bm++) {
+    var bmSlot = remainingToday[bm];
+    if (bmSlot.localHour >= 6 && bmSlot.localHour <= 11 && bmSlot.price >= dischargeAbsMin) {
+      if (bestMorning === null || bmSlot.price > bestMorning.price) {
+        bestMorning = bmSlot;
+      }
+    }
+  }
+  if (bestMorning !== null) {
+    expensiveHours.push(bestMorning.localHour);
+    if (dischargeThreshold === null || bestMorning.price < dischargeThreshold) {
+      dischargeThreshold = bestMorning.price;
+    }
+  }
+}
+
+var filteredDischargeHours = [];
+for (var fd = 0; fd < expensiveHours.length; fd++) {
+  if (cheapestHours.indexOf(expensiveHours[fd]) === -1) {
+    filteredDischargeHours.push(expensiveHours[fd]);
+  }
+}
+expensiveHours = filteredDischargeHours;
+
+dischargeThreshold = null;
+for (var rt = 0; rt < remainingToday.length; rt++) {
+  if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {
+    if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {
+      dischargeThreshold = remainingToday[rt].price;
+    }
+  }
+}
+
+var inDischargeWindow = expensiveHours.indexOf(currentHour) !== -1;
+
+cheapestHours.sort(function (a, b) { return a - b; });
+expensiveHours.sort(function (a, b) { return a - b; });
+
+msg.plannerVersion = PLANNER_VERSION;
+msg.inChargingWindow = inWindow;
+msg.inDischargeWindow = inDischargeWindow;
+msg.dischargeThreshold = dischargeThreshold;
+msg.plannedChargeHours = cheapestHours;
+msg.plannedDischargeHours = expensiveHours;
+msg.hoursNeeded = hoursNeeded;
+msg.kwhNeeded = parseFloat(kwhNeeded.toFixed(2));
+msg.cheapestPrice = cheapestPrice;
+msg.plannerReason = 'Need ' + kwhNeeded.toFixed(1) + ' kWh (' + hoursNeeded + 'h). ' +
+  'SoC ' + batterySoC + '% - charge cap: ' + chargePriceCap.toFixed(3) + ' EUR (' + (batterySoC >= SOC_NORMAL_THRESHOLD ? 'tight' : 'expanded') + '). ' +
+  'Avg: ' + avgPriceCalc.toFixed(3) + ' EUR. ' +
+  'Charge hours: ' + cheapestHours.map(function (h) { return h + 'h'; }).join(', ') +
+  '. Discharge hours: ' + expensiveHours.map(function (h) { return h + 'h'; }).join(', ') +
+  '. Discharge threshold: ' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +
+  '. In charge window: ' + inWindow +
+  '. In discharge window: ' + inDischargeWindow;
+
+node.status({
+  fill: inWindow ? 'green' : inDischargeWindow ? 'red' : 'grey',
+  shape: 'dot',
+  text: PLANNER_VERSION + ' ' + (inWindow ? 'CHG' : inDischargeWindow ? 'DCH' : 'IDLE') +
+    ' | SoC:' + batterySoC + '% cap:' + chargePriceCap.toFixed(2) +
+    ' | dch>' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + 'EUR' +
+    ' | hour ' + currentHour + 'h'
+});
+
+return msg;
