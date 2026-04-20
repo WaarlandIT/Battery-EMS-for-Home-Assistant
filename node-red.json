@@ -4,8 +4,9 @@
     "type": "tab",
     "label": "Battery EMS",
     "disabled": false,
-    "info": "Battery EMS v3.3 / Planner v2.4\nSmart battery charge/discharge management based on dynamic electricity prices, solar production and home consumption.\nOutputs: input_number.battery_dc_amps, input_boolean.battery_charging, input_boolean.battery_discharging"
+    "info": "Smart Battery Energy Management System\nEMS v3.5 / Planner v2.5\nInputs: Frank Energie prices, DSMR meter, Growatt solar (PAC), battery SoC\nOutputs: DC amps (0-200A), charge bool, discharge bool"
   },
+
   {
     "id": "inject-tick",
     "type": "inject",
@@ -21,8 +22,9 @@
     "payloadType": "date",
     "x": 110,
     "y": 80,
-    "wires": [["get-current-price"]]
+    "wires": [["get-frank-prices"]]
   },
+
   {
     "id": "dsmr-trigger",
     "type": "server-state-changed",
@@ -35,7 +37,7 @@
     "entityidfilter": "sensor.electricity_meter_energieverbruik",
     "entityidfiltertype": "exact",
     "outputinitially": false,
-    "state_type": "str",
+    "state_type": "num",
     "haltifstate": "",
     "halt_if_type": "str",
     "halt_if_compare": "is",
@@ -51,9 +53,10 @@
     "ignoreCurrentStateUnavailable": true,
     "outputProperties": [],
     "x": 110,
-    "y": 180,
-    "wires": [["get-current-price"]]
+    "y": 160,
+    "wires": [["get-frank-prices"]]
   },
+
   {
     "id": "price-trigger",
     "type": "server-state-changed",
@@ -63,10 +66,10 @@
     "version": 5,
     "exposeToHomeAssistant": false,
     "haConfig": [{"property": "name", "value": ""}, {"property": "icon", "value": ""}],
-    "entityidfilter": "sensor.frank_energie_prijzen_huidige_elektriciteitsprijs_all_in",
+    "entityidfilter": "sensor.energyzero_today_energy_current_hour_price",
     "entityidfiltertype": "exact",
-    "outputinitially": true,
-    "state_type": "str",
+    "outputinitially": false,
+    "state_type": "num",
     "haltifstate": "",
     "halt_if_type": "str",
     "halt_if_compare": "is",
@@ -82,43 +85,10 @@
     "ignoreCurrentStateUnavailable": true,
     "outputProperties": [],
     "x": 110,
-    "y": 280,
-    "wires": [["get-current-price"]]
-  },
-  {
-    "id": "get-current-price",
-    "type": "api-current-state",
-    "z": "ems-tab",
-    "name": "Current price",
-    "server": "ha-server",
-    "version": 3,
-    "outputs": 1,
-    "entity_id": "sensor.frank_energie_prijzen_huidige_elektriciteitsprijs_all_in",
-    "blockInputOverrides": false,
-    "outputProperties": [
-      {"property": "currentPrice", "propertyType": "msg", "value": "", "valueType": "entityState"}
-    ],
-    "x": 360,
-    "y": 80,
-    "wires": [["get-avg-price"]]
-  },
-  {
-    "id": "get-avg-price",
-    "type": "api-current-state",
-    "z": "ems-tab",
-    "name": "Avg price today",
-    "server": "ha-server",
-    "version": 3,
-    "outputs": 1,
-    "entity_id": "sensor.energyzero_today_energy_average_price",
-    "blockInputOverrides": false,
-    "outputProperties": [
-      {"property": "avgPrice", "propertyType": "msg", "value": "", "valueType": "entityState"}
-    ],
-    "x": 360,
-    "y": 160,
+    "y": 240,
     "wires": [["get-frank-prices"]]
   },
+
   {
     "id": "get-frank-prices",
     "type": "api-current-state",
@@ -127,48 +97,69 @@
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
     "entity_id": "sensor.frank_energie_prijzen_huidige_elektriciteitsprijs_all_in",
+    "state_type": "str",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "frankPrices", "propertyType": "msg", "value": "$entity().attributes.prices", "valueType": "jsonata"}
+      {
+        "property": "frankPrices",
+        "propertyType": "msg",
+        "value": "attributes.prices",
+        "valueType": "entity"
+      }
     ],
-    "x": 360,
-    "y": 240,
+    "x": 340,
+    "y": 160,
     "wires": [["get-soc"]]
   },
+
   {
     "id": "get-soc",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Battery SoC % (replace entity!)",
+    "name": "Battery SoC",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
     "entity_id": "sensor.battery_state_of_charge",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "batterySoC", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "batterySoC",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 320,
+    "x": 540,
+    "y": 160,
     "wires": [["price-planner"]]
   },
+
   {
     "id": "price-planner",
     "type": "function",
     "z": "ems-tab",
     "name": "Price Planner",
-    "func": "// Price Planner\n// v2.3 - version defined as single variable at top\n// v2.2 - SOC_NORMAL_THRESHOLD raised to 80%\n// v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected to 0.19\n// v2.0 - DISCHARGE_ABS_MIN raised to 0.19, dischargeThreshold recalculated after conflict filter\n\nvar PLANNER_VERSION      = 'v2.4';\nvar BATTERY_KWH          = 40;\nvar BATTERY_VOLTAGE      = 48;\nvar MAX_AMPS             = 200;\nvar ROUND_TRIP_EFF       = 0.85;\nvar SOC_MIN              = 10;\nvar SOC_MAX              = 95;\nvar SAFETY_BUFFER_H      = 1;\nvar DISCHARGE_ABS_MIN    = 0.19;\nvar CHARGE_ABS_MAX       = 0.12;\nvar SOC_NORMAL_THRESHOLD = 90;\n\nvar maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;\n\nvar batterySoC = parseFloat(msg.batterySoC) || parseFloat(context.get('lastSoC')) || 50;\ncontext.set('lastSoC', batterySoC);\n\nvar usableCapacity = BATTERY_KWH * ((SOC_MAX - SOC_MIN) / 100);\nvar currentKwh     = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);\nvar kwhNeeded      = Math.max(0, usableCapacity - currentKwh);\nvar hoursNeeded    = Math.ceil(kwhNeeded / maxChargeKw) + SAFETY_BUFFER_H;\n\nvar prices = null;\nif (Array.isArray(msg.frankPrices)) {\n  prices = msg.frankPrices;\n} else if (msg.frankPrices && Array.isArray(msg.frankPrices.prices)) {\n  prices = msg.frankPrices.prices;\n}\n\nif (!prices || prices.length === 0) {\n  msg.plannerVersion        = PLANNER_VERSION;\n  msg.inChargingWindow      = null;\n  msg.inDischargeWindow     = null;\n  msg.dischargeThreshold    = null;\n  msg.plannedChargeHours    = [];\n  msg.plannedDischargeHours = [];\n  msg.hoursNeeded           = hoursNeeded;\n  msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));\n  msg.cheapestPrice         = null;\n  msg.plannerReason         = 'No price schedule available - using ratio fallback';\n  node.status({ fill: 'yellow', shape: 'dot', text: PLANNER_VERSION + ' No price data - fallback mode' });\n  return msg;\n}\n\nvar now          = new Date();\nvar nowMs        = now.getTime();\nvar localOffset  = now.getTimezoneOffset() * 60000;\nvar localNow     = new Date(nowMs - localOffset);\nvar localDateStr = localNow.toISOString().substring(0, 10);\nvar currentHour  = now.getHours();\n\nvar allParsed = [];\nfor (var i = 0; i < prices.length; i++) {\n  var p        = prices[i];\n  var fromDate = new Date(p.from);\n  var tillDate = new Date(p.till);\n  allParsed.push({\n    from:      fromDate,\n    till:      tillDate,\n    price:     parseFloat(p.price),\n    localHour: parseInt(p.from.substring(11, 13), 10),\n    dateStr:   p.from.substring(0, 10)\n  });\n}\n\nvar currentPriceCalc = null;\nvar totalPrice       = 0;\nvar todayCount       = 0;\nfor (var cp = 0; cp < allParsed.length; cp++) {\n  if (allParsed[cp].dateStr === localDateStr) {\n    totalPrice += allParsed[cp].price;\n    todayCount++;\n    if (allParsed[cp].localHour === currentHour) {\n      currentPriceCalc = allParsed[cp].price;\n    }\n  }\n}\nvar avgPriceCalc = todayCount > 0 ? totalPrice / todayCount : 0.10;\n\nmsg.currentPrice = currentPriceCalc !== null ? String(currentPriceCalc) : msg.currentPrice;\nmsg.avgPrice     = String(parseFloat(avgPriceCalc.toFixed(4)));\n\nvar todayPrices    = [];\nvar tomorrowPrices = [];\nfor (var t = 0; t < allParsed.length; t++) {\n  if (allParsed[t].dateStr === localDateStr) {\n    todayPrices.push(allParsed[t]);\n  } else {\n    tomorrowPrices.push(allParsed[t]);\n  }\n}\n\nvar remainingToday = [];\nfor (var r = 0; r < todayPrices.length; r++) {\n  if (todayPrices[r].till.getTime() > nowMs) {\n    remainingToday.push(todayPrices[r]);\n  }\n}\n\nvar chargePriceCap = batterySoC >= SOC_NORMAL_THRESHOLD\n  ? CHARGE_ABS_MAX\n  : avgPriceCalc * 0.99;\n\nvar planPrices = remainingToday.concat(tomorrowPrices);\nplanPrices.sort(function(a, b) { return a.price - b.price; });\n\nvar eligibleSlots = [];\nfor (var e = 0; e < planPrices.length; e++) {\n  if (planPrices[e].price <= chargePriceCap) {\n    eligibleSlots.push(planPrices[e]);\n  }\n}\nvar cheapestSlots = eligibleSlots.slice(0, hoursNeeded);\nvar cheapestHours = [];\nfor (var j = 0; j < cheapestSlots.length; j++) {\n  cheapestHours.push(cheapestSlots[j].localHour);\n}\nvar inWindow      = cheapestHours.indexOf(currentHour) !== -1;\nvar cheapestPrice = planPrices.length > 0 ? planPrices[0].price : null;\n\nvar fullCurve = todayPrices.concat(tomorrowPrices);\nfullCurve.sort(function(a, b) { return a.from.getTime() - b.from.getTime(); });\n\nvar localPeaks = [];\nfor (var n = 1; n < fullCurve.length - 1; n++) {\n  var prev = fullCurve[n - 1].price;\n  var curr = fullCurve[n].price;\n  var next = fullCurve[n + 1].price;\n  if (curr > prev + 0.008 && curr > next + 0.008) {\n    localPeaks.push(fullCurve[n].localHour + '_' + fullCurve[n].dateStr);\n  }\n}\nif (fullCurve.length >= 2) {\n  if (fullCurve[0].price > fullCurve[1].price + 0.008) {\n    localPeaks.push(fullCurve[0].localHour + '_' + fullCurve[0].dateStr);\n  }\n  var last = fullCurve.length - 1;\n  if (fullCurve[last].price > fullCurve[last - 1].price + 0.008) {\n    localPeaks.push(fullCurve[last].localHour + '_' + fullCurve[last].dateStr);\n  }\n}\n\nvar expensiveHours     = [];\nvar dischargeThreshold = null;\nfor (var d = 0; d < remainingToday.length; d++) {\n  var slot    = remainingToday[d];\n  var slotKey = slot.localHour + '_' + slot.dateStr;\n  if (slot.price >= DISCHARGE_ABS_MIN && localPeaks.indexOf(slotKey) !== -1) {\n    expensiveHours.push(slot.localHour);\n    if (dischargeThreshold === null || slot.price < dischargeThreshold) {\n      dischargeThreshold = slot.price;\n    }\n  }\n}\n\nvar highestPeakPrice = 0;\nfor (var hp = 0; hp < expensiveHours.length; hp++) {\n  for (var hpc = 0; hpc < remainingToday.length; hpc++) {\n    if (remainingToday[hpc].localHour === expensiveHours[hp] && remainingToday[hpc].price > highestPeakPrice) {\n      highestPeakPrice = remainingToday[hpc].price;\n    }\n  }\n}\nvar peakShoulderMin = highestPeakPrice * 0.88;\nfor (var sh = 0; sh < remainingToday.length; sh++) {\n  var shSlot = remainingToday[sh];\n  if (shSlot.price >= peakShoulderMin && shSlot.price >= DISCHARGE_ABS_MIN) {\n    if (expensiveHours.indexOf(shSlot.localHour) === -1) {\n      expensiveHours.push(shSlot.localHour);\n      if (dischargeThreshold === null || shSlot.price < dischargeThreshold) {\n        dischargeThreshold = shSlot.price;\n      }\n    }\n  }\n}\n\nvar hasMorningPeak = false;\nfor (var mp = 0; mp < expensiveHours.length; mp++) {\n  if (expensiveHours[mp] >= 6 && expensiveHours[mp] <= 11) {\n    hasMorningPeak = true;\n    break;\n  }\n}\nif (!hasMorningPeak) {\n  var bestMorning = null;\n  for (var bm = 0; bm < remainingToday.length; bm++) {\n    var bmSlot = remainingToday[bm];\n    if (bmSlot.localHour >= 6 && bmSlot.localHour <= 11 && bmSlot.price >= DISCHARGE_ABS_MIN) {\n      if (bestMorning === null || bmSlot.price > bestMorning.price) {\n        bestMorning = bmSlot;\n      }\n    }\n  }\n  if (bestMorning !== null) {\n    expensiveHours.push(bestMorning.localHour);\n    if (dischargeThreshold === null || bestMorning.price < dischargeThreshold) {\n      dischargeThreshold = bestMorning.price;\n    }\n  }\n}\n\nvar filteredDischargeHours = [];\nfor (var fd = 0; fd < expensiveHours.length; fd++) {\n  if (cheapestHours.indexOf(expensiveHours[fd]) === -1) {\n    filteredDischargeHours.push(expensiveHours[fd]);\n  }\n}\nexpensiveHours = filteredDischargeHours;\n\ndischargeThreshold = null;\nfor (var rt = 0; rt < remainingToday.length; rt++) {\n  if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {\n    if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {\n      dischargeThreshold = remainingToday[rt].price;\n    }\n  }\n}\n\nvar inDischargeWindow = expensiveHours.indexOf(currentHour) !== -1;\n\ncheapestHours.sort(function(a, b) { return a - b; });\nexpensiveHours.sort(function(a, b) { return a - b; });\n\nmsg.plannerVersion        = PLANNER_VERSION;\nmsg.inChargingWindow      = inWindow;\nmsg.inDischargeWindow     = inDischargeWindow;\nmsg.dischargeThreshold    = dischargeThreshold;\nmsg.plannedChargeHours    = cheapestHours;\nmsg.plannedDischargeHours = expensiveHours;\nmsg.hoursNeeded           = hoursNeeded;\nmsg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));\nmsg.cheapestPrice         = cheapestPrice;\nmsg.plannerReason         = 'Need ' + kwhNeeded.toFixed(1) + ' kWh (' + hoursNeeded + 'h). ' +\n  'SoC ' + batterySoC + '% - charge cap: ' + chargePriceCap.toFixed(3) + ' EUR (' + (batterySoC >= SOC_NORMAL_THRESHOLD ? 'tight' : 'expanded') + '). ' +\n  'Avg: ' + avgPriceCalc.toFixed(3) + ' EUR. ' +\n  'Charge hours: ' + cheapestHours.map(function(h) { return h + 'h'; }).join(', ') +\n  '. Discharge hours: ' + expensiveHours.map(function(h) { return h + 'h'; }).join(', ') +\n  '. Discharge threshold: ' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +\n  '. In charge window: ' + inWindow +\n  '. In discharge window: ' + inDischargeWindow;\n\nnode.status({\n  fill:  inWindow ? 'green' : inDischargeWindow ? 'red' : 'grey',\n  shape: 'dot',\n  text:  PLANNER_VERSION + ' ' + (inWindow ? 'CHG' : inDischargeWindow ? 'DCH' : 'IDLE') +\n    ' | SoC:' + batterySoC + '% cap:' + chargePriceCap.toFixed(2) +\n    ' | dch>' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + 'EUR' +\n    ' | hour ' + currentHour + 'h'\n});\n\nreturn msg;\n",
+    "func": "// Price Planner\n// v2.5 - dynamic CHARGE_ABS_RATIO/DISCHARGE_ABS_RATIO aligned with EMS v3.5\n// v2.4 - avgPrice and currentPrice calculated from Frank Energie array\n// v2.3 - version defined as single variable at top\n// v2.2 - SOC_NORMAL_THRESHOLD raised to 80%\n// v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected\n// v2.0 - dischargeThreshold recalculated after conflict filter\n\nvar PLANNER_VERSION      = 'v2.5';\nvar BATTERY_KWH          = 40;\nvar BATTERY_VOLTAGE      = 48;\nvar MAX_AMPS             = 200;\nvar ROUND_TRIP_EFF       = 0.85;\nvar SOC_MIN              = 10;\nvar SOC_MAX              = 95;\nvar SAFETY_BUFFER_H      = 1;\nvar SOC_NORMAL_THRESHOLD = 80;\nvar CHARGE_ABS_RATIO     = 0.55;\nvar DISCHARGE_ABS_RATIO  = 0.55;\n\nvar maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;\n\nvar batterySoC = parseFloat(msg.batterySoC) || parseFloat(context.get('lastSoC')) || 50;\ncontext.set('lastSoC', batterySoC);\n\nvar usableCapacity = BATTERY_KWH * ((SOC_MAX - SOC_MIN) / 100);\nvar currentKwh     = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);\nvar kwhNeeded      = Math.max(0, usableCapacity - currentKwh);\nvar hoursNeeded    = Math.ceil(kwhNeeded / maxChargeKw) + SAFETY_BUFFER_H;\n\nvar prices = null;\nif (Array.isArray(msg.frankPrices)) {\n  prices = msg.frankPrices;\n} else if (msg.frankPrices && Array.isArray(msg.frankPrices.prices)) {\n  prices = msg.frankPrices.prices;\n}\n\nif (!prices || prices.length === 0) {\n  msg.plannerVersion        = PLANNER_VERSION;\n  msg.inChargingWindow      = null;\n  msg.inDischargeWindow     = null;\n  msg.dischargeThreshold    = null;\n  msg.plannedChargeHours    = [];\n  msg.plannedDischargeHours = [];\n  msg.hoursNeeded           = hoursNeeded;\n  msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));\n  msg.cheapestPrice         = null;\n  msg.plannerReason         = 'No price schedule available - using ratio fallback';\n  node.status({ fill: 'yellow', shape: 'dot', text: PLANNER_VERSION + ' No price data - fallback mode' });\n  return msg;\n}\n\nvar now         = new Date();\nvar currentHour = now.getHours();\nvar localOffset  = now.getTimezoneOffset() * 60000;\nvar localNow     = new Date(now.getTime() - localOffset);\nvar localDateStr = localNow.toISOString().substring(0, 10);\n\nvar allParsed        = [];\nvar totalPrice       = 0;\nvar todayCount       = 0;\nvar currentPriceCalc = null;\n\nfor (var i = 0; i < prices.length; i++) {\n  var p         = prices[i];\n  var fromDate  = new Date(p.from);\n  var tillDate  = new Date(p.till);\n  var localHour = parseInt(p.from.substring(11, 13), 10);\n  var dateStr   = p.from.substring(0, 10);\n  allParsed.push({ from: fromDate, till: tillDate, price: parseFloat(p.price), localHour: localHour, dateStr: dateStr });\n  if (dateStr === localDateStr) {\n    totalPrice += parseFloat(p.price);\n    todayCount++;\n    if (localHour === currentHour) { currentPriceCalc = parseFloat(p.price); }\n  }\n}\n\nvar avgPriceCalc = todayCount > 0 ? totalPrice / todayCount : 0.10;\nmsg.currentPrice = currentPriceCalc !== null ? String(currentPriceCalc) : msg.currentPrice;\nmsg.avgPrice     = String(avgPriceCalc);\n\nvar chargePriceCap  = batterySoC >= SOC_NORMAL_THRESHOLD ? avgPriceCalc * CHARGE_ABS_RATIO : avgPriceCalc * 0.99;\nvar dischargeAbsMin = avgPriceCalc * DISCHARGE_ABS_RATIO;\n\nvar remainingToday = [];\nfor (var r = 0; r < allParsed.length; r++) {\n  if (allParsed[r].dateStr === localDateStr && allParsed[r].till > now) {\n    remainingToday.push(allParsed[r]);\n  }\n}\n\nvar planPrices = remainingToday.slice();\nplanPrices.sort(function(a, b) { return a.price - b.price; });\n\nvar cheapestPrice = planPrices.length > 0 ? planPrices[0].price : null;\n\nvar eligibleSlots = [];\nfor (var e = 0; e < planPrices.length; e++) {\n  if (planPrices[e].price <= chargePriceCap) { eligibleSlots.push(planPrices[e]); }\n}\nvar cheapestSlots = eligibleSlots.slice(0, hoursNeeded);\nvar cheapestHours = [];\nfor (var j = 0; j < cheapestSlots.length; j++) { cheapestHours.push(cheapestSlots[j].localHour); }\n\nvar inWindow = cheapestHours.indexOf(currentHour) !== -1;\n\nvar morningBand = [];\nvar eveningBand = [];\nfor (var m = 0; m < remainingToday.length; m++) {\n  var ph = remainingToday[m];\n  if (ph.price >= dischargeAbsMin) {\n    if (ph.localHour >= 6 && ph.localHour <= 11) { morningBand.push(ph); }\n    else if (ph.localHour >= 16 && ph.localHour <= 23) { eveningBand.push(ph); }\n  }\n}\n\nmorningBand.sort(function(a, b) { return b.price - a.price; });\neveningBand.sort(function(a, b) { return b.price - a.price; });\n\nvar morningCount   = Math.ceil(morningBand.length * 0.50);\nvar eveningCount   = Math.ceil(eveningBand.length * 0.50);\nvar expensiveSlots = morningBand.slice(0, morningCount).concat(eveningBand.slice(0, eveningCount));\n\nvar expensiveHours = [];\nfor (var k = 0; k < expensiveSlots.length; k++) { expensiveHours.push(expensiveSlots[k].localHour); }\n\nvar dischargeThreshold = null;\nif (expensiveSlots.length > 0) {\n  var minExpPrice = expensiveSlots[0].price;\n  for (var et = 1; et < expensiveSlots.length; et++) {\n    if (expensiveSlots[et].price < minExpPrice) minExpPrice = expensiveSlots[et].price;\n  }\n  dischargeThreshold = minExpPrice;\n}\n\nvar filteredDischargeHours = [];\nfor (var fd = 0; fd < expensiveHours.length; fd++) {\n  if (cheapestHours.indexOf(expensiveHours[fd]) === -1) { filteredDischargeHours.push(expensiveHours[fd]); }\n}\nexpensiveHours = filteredDischargeHours;\n\ndischargeThreshold = null;\nfor (var rt = 0; rt < remainingToday.length; rt++) {\n  if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {\n    if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {\n      dischargeThreshold = remainingToday[rt].price;\n    }\n  }\n}\n\ncheapestHours.sort(function(a, b) { return a - b; });\nexpensiveHours.sort(function(a, b) { return a - b; });\n\nvar inDischargeWindow = expensiveHours.indexOf(currentHour) !== -1;\n\nmsg.plannerVersion        = PLANNER_VERSION;\nmsg.inChargingWindow      = inWindow;\nmsg.inDischargeWindow     = inDischargeWindow;\nmsg.dischargeThreshold    = dischargeThreshold;\nmsg.plannedChargeHours    = cheapestHours;\nmsg.plannedDischargeHours = expensiveHours;\nmsg.hoursNeeded           = hoursNeeded;\nmsg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));\nmsg.cheapestPrice         = cheapestPrice;\nmsg.plannerReason         =\n  'Need ' + kwhNeeded.toFixed(1) + ' kWh (' + hoursNeeded + 'h). ' +\n  'SoC ' + batterySoC + '% - charge cap: ' + chargePriceCap.toFixed(3) + ' EUR (' + (batterySoC >= SOC_NORMAL_THRESHOLD ? 'tight' : 'expanded') + '). ' +\n  'Avg: ' + avgPriceCalc.toFixed(3) + ' EUR. ' +\n  'Charge hours: ' + cheapestHours.map(function(h) { return h + 'h'; }).join(', ') +\n  '. Discharge hours: ' + expensiveHours.map(function(h) { return h + 'h'; }).join(', ') +\n  '. Discharge threshold: ' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +\n  '. In charge window: ' + inWindow +\n  '. In discharge window: ' + inDischargeWindow;\n\nnode.status({\n  fill:  inWindow ? 'green' : inDischargeWindow ? 'red' : 'grey',\n  shape: 'dot',\n  text:  PLANNER_VERSION + ' ' + (inWindow ? 'CHG' : inDischargeWindow ? 'DCH' : 'IDLE') +\n    ' | SoC:' + batterySoC + '% cap:' + chargePriceCap.toFixed(2) +\n    ' | dch>' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + 'EUR' +\n    ' | hour ' + currentHour + 'h'\n});\n\nreturn msg;\n",
     "outputs": 1,
     "timeout": 0,
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 360,
-    "y": 400,
+    "x": 740,
+    "y": 160,
     "wires": [["get-grid-import"]]
   },
+
   {
     "id": "get-grid-import",
     "type": "api-current-state",
@@ -177,15 +168,25 @@
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.electricity_meter_energieverbruik",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.dsmr_reading_electricity_currently_delivered",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "gridImport", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "gridImport",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 480,
+    "x": 940,
+    "y": 160,
     "wires": [["get-grid-export"]]
   },
+
   {
     "id": "get-grid-export",
     "type": "api-current-state",
@@ -194,136 +195,304 @@
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.electricity_meter_energieproductie",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.dsmr_reading_electricity_currently_returned",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "gridExport", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "gridExport",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 560,
+    "x": 1140,
+    "y": 160,
     "wires": [["get-phase-l1"]]
   },
+
   {
     "id": "get-phase-l1",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Phase L1 consumption kW",
+    "name": "Phase L1 kW",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.electricity_meter_power_consumption_phase_l1",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.dsmr_reading_phase_currently_delivered_l1",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "phaseL1", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "phaseL1",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 640,
+    "x": 110,
+    "y": 340,
     "wires": [["get-phase-l2"]]
   },
+
   {
     "id": "get-phase-l2",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Phase L2 consumption kW",
+    "name": "Phase L2 kW",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.electricity_meter_power_consumption_phase_l2",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.dsmr_reading_phase_currently_delivered_l2",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "phaseL2", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "phaseL2",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 720,
+    "x": 310,
+    "y": 340,
     "wires": [["get-phase-l3"]]
   },
+
   {
     "id": "get-phase-l3",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Phase L3 consumption kW",
+    "name": "Phase L3 kW",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.electricity_meter_power_consumption_phase_l3",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.dsmr_reading_phase_currently_delivered_l3",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "phaseL3", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "phaseL3",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 800,
+    "x": 510,
+    "y": 340,
     "wires": [["get-solar-pac1"]]
   },
+
   {
     "id": "get-solar-pac1",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Growatt PAC1 W",
+    "name": "Solar PAC1 W",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.growatt_acpower_pac1_safe",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.growatt_pac1",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "pac1", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "pac1",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 880,
+    "x": 710,
+    "y": 340,
     "wires": [["get-solar-pac2"]]
   },
+
   {
     "id": "get-solar-pac2",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Growatt PAC2 W",
+    "name": "Solar PAC2 W",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.growatt_acpower_pac2_safe",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.growatt_pac2",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "pac2", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "pac2",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 960,
+    "x": 910,
+    "y": 340,
     "wires": [["get-solar-pac3"]]
   },
+
   {
     "id": "get-solar-pac3",
     "type": "api-current-state",
     "z": "ems-tab",
-    "name": "Growatt PAC3 W",
+    "name": "Solar PAC3 W",
     "server": "ha-server",
     "version": 3,
     "outputs": 1,
-    "entity_id": "sensor.growatt_acpower_pac3_safe",
+    "halt_if": "",
+    "halt_if_type": "str",
+    "halt_if_compare": "is",
+    "entity_id": "sensor.growatt_pac3",
+    "state_type": "num",
     "blockInputOverrides": false,
     "outputProperties": [
-      {"property": "pac3", "propertyType": "msg", "value": "", "valueType": "entityState"}
+      {
+        "property": "pac3",
+        "propertyType": "msg",
+        "value": "",
+        "valueType": "entityState"
+      }
     ],
-    "x": 360,
-    "y": 1040,
+    "x": 1110,
+    "y": 340,
     "wires": [["ems-logic"]]
   },
+
   {
     "id": "ems-logic",
     "type": "function",
     "z": "ems-tab",
     "name": "EMS Decision Engine",
-    "func": "// EMS Decision Engine\n// v3.3 - solar surplus uses separate canChargeSolar flag, never blocked by price or SoC threshold\n// v3.2 - solar surplus before discharge, SOC_DISCHARGE_MIN 15%, gross import target\n// v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%\n// v3.0 - P1 phase readings used directly\n\nvar EMS_VERSION = 'EMS v3.3';\nvar CFG = {\n  MAX_AMPS:             200,\n  BATTERY_VOLTAGE:      48,\n  BATTERY_KWH:          40,\n  SOC_MIN:              10,\n  SOC_MAX:              95,\n  SOC_DISCHARGE_MIN:    15,\n  SOC_CRITICAL:         20,\n  CHARGE_THRESHOLD:     0.80,\n  DISCHARGE_THRESHOLD:  1.20,\n  CHARGE_ABS_MAX:       0.10,\n  DISCHARGE_ABS_MIN:    0.12,\n  DISCHARGE_OVERSHOOT:  1.25,\n  EXPORT_BIAS_W:        800,\n  HYSTERESIS:           0.05,\n  SOLAR_SURPLUS_W:      500,\n  SOLAR_SURPLUS_EXIT_W: 200,\n  ROUND_TRIP_EFF:       0.85,\n  GRID_MAX_A_PHASE:     18,\n  GRID_VOLTAGE:         230,\n  SAFETY_MARGIN_A:      2,\n  MIN_DISCHARGE_A:      35\n};\n\nvar currentPrice     = parseFloat(msg.currentPrice) || 0;\nvar avgPrice         = parseFloat(msg.avgPrice)     || 0.10;\nvar inChargingWindow = msg.inChargingWindow;\n\nvar gridImport       = parseFloat(msg.gridImport) || 0;\nvar gridExport       = parseFloat(msg.gridExport) || 0;\nvar netGridW         = (gridImport - gridExport) * 1000;\nvar dischargeTargetW = gridImport * 1000;\n\nvar phaseL1kW  = parseFloat(msg.phaseL1)   || 0;\nvar phaseL2kW  = parseFloat(msg.phaseL2)   || 0;\nvar phaseL3kW  = parseFloat(msg.phaseL3)   || 0;\nvar pac1       = parseFloat(msg.pac1)       || 0;\nvar pac2       = parseFloat(msg.pac2)       || 0;\nvar pac3       = parseFloat(msg.pac3)       || 0;\nvar batterySoC = parseFloat(msg.batterySoC) || 50;\n\nvar lastState    = context.get('lastState')    || 'idle';\nvar pendingState = context.get('pendingState') || 'idle';\nvar pendingCount = context.get('pendingCount') || 0;\n\nvar solarTotalW    = pac1 + pac2 + pac3;\nvar actualSurplusW = (netGridW < 0 && solarTotalW > 50 && Math.abs(netGridW) <= solarTotalW * 1.3) ? Math.abs(netGridW) : 0;\n\nvar priceRatio  = avgPrice > 0 ? currentPrice / avgPrice : 1;\nvar isNegPrice  = currentPrice < 0;\n\nvar chargeRatioThreshold    = lastState === 'charging'    ? CFG.CHARGE_THRESHOLD    + CFG.HYSTERESIS : CFG.CHARGE_THRESHOLD;\nvar dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;\n\nvar isPriceLow;\nif (batterySoC < CFG.SOC_CRITICAL && currentPrice < avgPrice) {\n  isPriceLow = true;\n} else if (inChargingWindow === null) {\n  isPriceLow = (priceRatio <= chargeRatioThreshold && currentPrice <= CFG.CHARGE_ABS_MAX) || isNegPrice;\n} else {\n  isPriceLow = inChargingWindow || isNegPrice;\n}\n\nvar isPriceHigh;\nif (msg.inDischargeWindow === true) {\n  isPriceHigh = true;\n} else {\n  isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= CFG.DISCHARGE_ABS_MIN;\n}\n\nvar canCharge      = batterySoC < CFG.SOC_MAX || isNegPrice;\nvar canChargeSolar = batterySoC < CFG.SOC_MAX;\nvar canDischarge   = (batterySoC > CFG.SOC_MIN || batterySoC > CFG.SOC_MAX) && batterySoC >= CFG.SOC_DISCHARGE_MIN;\n\nvar phaseL1A            = (phaseL1kW * 1000) / CFG.GRID_VOLTAGE;\nvar phaseL2A            = (phaseL2kW * 1000) / CFG.GRID_VOLTAGE;\nvar phaseL3A            = (phaseL3kW * 1000) / CFG.GRID_VOLTAGE;\nvar maxPhaseLoadA       = Math.max(phaseL1A, phaseL2A, phaseL3A);\nvar worstPhaseHeadroomA = Math.max(0, CFG.GRID_MAX_A_PHASE - maxPhaseLoadA - CFG.SAFETY_MARGIN_A);\nvar gridHeadroomW       = worstPhaseHeadroomA * CFG.GRID_VOLTAGE * 3;\nvar maxChargeFromGridA  = Math.round((gridHeadroomW / CFG.BATTERY_VOLTAGE) * CFG.ROUND_TRIP_EFF);\nvar maxAllowedChargeA   = Math.min(CFG.MAX_AMPS, maxChargeFromGridA);\n\nvar solarSurplusThreshold = lastState === 'charging' ? CFG.SOLAR_SURPLUS_EXIT_W : CFG.SOLAR_SURPLUS_W;\n\nvar CONFIRM_CYCLES = (isPriceLow || isPriceHigh || isNegPrice || (actualSurplusW > solarSurplusThreshold && canChargeSolar)) ? 1 : 2;\n\nvar charging    = false;\nvar discharging = false;\nvar targetAmps  = 0;\nvar reason      = '';\n\nif (isNegPrice && canCharge) {\n  charging   = true;\n  targetAmps = maxAllowedChargeA;\n  reason     = 'Negative price (' + currentPrice.toFixed(3) + ' EUR/kWh) - charging at ' + targetAmps + ' A (worst phase headroom: ' + worstPhaseHeadroomA.toFixed(1) + ' A)';\n\n} else if (isPriceLow && canCharge) {\n  var priceDiscount = 1 - priceRatio;\n  var fraction      = 0.50 + (priceDiscount * 2.5);\n  charging   = true;\n  targetAmps = Math.round(Math.min(maxAllowedChargeA, maxAllowedChargeA * fraction));\n  if (batterySoC < CFG.SOC_CRITICAL) {\n    targetAmps = maxAllowedChargeA;\n    reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';\n  } else {\n    reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';\n  }\n\n} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar) {\n  var surplusAmps = Math.round((actualSurplusW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF);\n  charging   = true;\n  targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);\n  reason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';\n\n} else if (isPriceHigh && canDischarge) {\n  if (dischargeTargetW > 0) {\n    var targetW     = dischargeTargetW + CFG.EXPORT_BIAS_W;\n    var neededAmps  = Math.round((targetW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF * CFG.DISCHARGE_OVERSHOOT);\n    var clampedAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, neededAmps));\n    discharging = true;\n    targetAmps  = clampedAmps;\n    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import + ' + CFG.EXPORT_BIAS_W + ' W export bias' + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');\n  } else {\n    discharging = true;\n    targetAmps  = CFG.MIN_DISCHARGE_A;\n    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price (solar export: ' + actualSurplusW.toFixed(0) + ' W)';\n  }\n\n} else {\n  reason = 'Idle - SoC ' + batterySoC + '%, price ' + currentPrice.toFixed(3) + ' EUR (' + (priceRatio * 100).toFixed(0) + '% of avg), solar ' + solarTotalW.toFixed(0) + ' W, netGrid ' + netGridW.toFixed(0) + ' W | ' + (msg.plannerReason || 'no planner');\n}\n\nif (charging && discharging) {\n  discharging = false;\n  reason += ' [conflict resolved: charge wins]';\n}\nif (targetAmps === 0) {\n  charging    = false;\n  discharging = false;\n}\n\ncontext.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');\n\nvar rawState = charging ? 'charging' : discharging ? 'discharging' : 'idle';\nvar confirmedState;\nif (rawState === pendingState) {\n  var newCount = pendingCount + 1;\n  context.set('pendingCount', newCount);\n  if (newCount >= CONFIRM_CYCLES) {\n    confirmedState = rawState;\n    context.set('lastState', rawState);\n  } else {\n    confirmedState = lastState;\n    reason += ' [confirming ' + newCount + '/' + CONFIRM_CYCLES + ']';\n  }\n} else {\n  context.set('pendingState', rawState);\n  context.set('pendingCount', 1);\n  confirmedState = lastState;\n  reason += ' [pending change to ' + rawState + ' 1/' + CONFIRM_CYCLES + ']';\n}\n\ncharging    = confirmedState === 'charging';\ndischarging = confirmedState === 'discharging';\ntargetAmps  = (charging || discharging) ? targetAmps : 0;\n\nif (targetAmps === 0) {\n  charging    = false;\n  discharging = false;\n}\n\nmsg.payload = {\n  version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),\n  dc_amps:     targetAmps,\n  charging:    charging,\n  discharging: discharging,\n  reason:      reason,\n  planner: {\n    inWindow:              msg.inChargingWindow,\n    inDischargeWindow:     msg.inDischargeWindow,\n    dischargeThreshold:    msg.dischargeThreshold || null,\n    hoursNeeded:           msg.hoursNeeded,\n    kwhNeeded:             msg.kwhNeeded,\n    cheapestPrice:         msg.cheapestPrice,\n    plannedHours:          msg.plannedChargeHours,\n    plannedDischargeHours: msg.plannedDischargeHours,\n    reason:                msg.plannerReason\n  },\n  inputs: {\n    currentPrice:        currentPrice,\n    avgPrice:            avgPrice,\n    priceRatio:          parseFloat((priceRatio * 100).toFixed(1)),\n    lastState:           lastState,\n    batterySoC:          batterySoC,\n    solarTotal_W:        solarTotalW,\n    netGrid_W:           netGridW,\n    dischargeTarget_W:   dischargeTargetW,\n    actualSurplus_W:     actualSurplusW,\n    phaseL1_A:           parseFloat(phaseL1A.toFixed(2)),\n    phaseL2_A:           parseFloat(phaseL2A.toFixed(2)),\n    phaseL3_A:           parseFloat(phaseL3A.toFixed(2)),\n    batteryAcPerPhase_A: 0,\n    houseL1_A:           parseFloat(phaseL1A.toFixed(2)),\n    houseL2_A:           parseFloat(phaseL2A.toFixed(2)),\n    houseL3_A:           parseFloat(phaseL3A.toFixed(2)),\n    maxPhaseLoad_A:      parseFloat(maxPhaseLoadA.toFixed(2)),\n    worstHeadroom_A:     parseFloat(worstPhaseHeadroomA.toFixed(2)),\n    gridHeadroom_W:      parseFloat(gridHeadroomW.toFixed(0)),\n    maxAllowedCharge_A:  maxAllowedChargeA\n  },\n  timestamp: new Date().toISOString()\n};\n\nnode.status({\n  fill:  charging ? 'green' : discharging ? 'red' : 'grey',\n  shape: 'dot',\n  text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'\n});\n\nreturn msg;\n",
+    "func": "// EMS Decision Engine\n// v3.5 - canDischarge bug fixed (|| SOC_MAX always true), discharge amp calc fixed (removed ROUND_TRIP_EFF from discharge path)\n// v3.4 - all fixed price thresholds replaced with ratios of today's average\n// v3.3 - solar surplus canChargeSolar flag, never blocked by price or SoC threshold\n// v3.2 - solar surplus before discharge, SOC_DISCHARGE_MIN 15%, gross import target\n// v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%\n// v3.0 - P1 phase readings used directly\n\nvar EMS_VERSION = 'EMS v3.5';\n\nvar CFG = {\n  MAX_AMPS:             200,\n  BATTERY_VOLTAGE:      48,\n  BATTERY_KWH:          40,\n  SOC_MIN:              10,\n  SOC_MAX:              95,\n  SOC_DISCHARGE_MIN:    15,\n  SOC_CRITICAL:         20,\n  CHARGE_THRESHOLD:     0.80,\n  DISCHARGE_THRESHOLD:  1.20,\n  CHARGE_ABS_RATIO:     0.55,\n  DISCHARGE_ABS_RATIO:  0.55,\n  DISCHARGE_OVERSHOOT:  1.25,\n  EXPORT_BIAS_W:        800,\n  HYSTERESIS:           0.05,\n  SOLAR_SURPLUS_W:      500,\n  SOLAR_SURPLUS_EXIT_W: 200,\n  ROUND_TRIP_EFF:       0.85,\n  GRID_MAX_A_PHASE:     18,\n  GRID_VOLTAGE:         230,\n  SAFETY_MARGIN_A:      2,\n  MIN_DISCHARGE_A:      35\n};\n\nvar currentPrice     = parseFloat(msg.currentPrice) || 0;\nvar avgPrice         = parseFloat(msg.avgPrice)     || 0.10;\nvar inChargingWindow = msg.inChargingWindow;\n\nvar gridImport       = parseFloat(msg.gridImport) || 0;\nvar gridExport       = parseFloat(msg.gridExport) || 0;\nvar netGridW         = (gridImport - gridExport) * 1000;\nvar dischargeTargetW = gridImport * 1000;\n\nvar phaseL1kW  = parseFloat(msg.phaseL1)   || 0;\nvar phaseL2kW  = parseFloat(msg.phaseL2)   || 0;\nvar phaseL3kW  = parseFloat(msg.phaseL3)   || 0;\nvar pac1       = parseFloat(msg.pac1)       || 0;\nvar pac2       = parseFloat(msg.pac2)       || 0;\nvar pac3       = parseFloat(msg.pac3)       || 0;\nvar batterySoC = parseFloat(msg.batterySoC) || 50;\n\nvar lastState    = context.get('lastState')    || 'idle';\nvar pendingState = context.get('pendingState') || 'idle';\nvar pendingCount = context.get('pendingCount') || 0;\n\nvar solarTotalW    = pac1 + pac2 + pac3;\nvar actualSurplusW = (netGridW < 0 && solarTotalW > 50 && Math.abs(netGridW) <= solarTotalW * 1.3) ? Math.abs(netGridW) : 0;\n\nvar priceRatio  = avgPrice > 0 ? currentPrice / avgPrice : 1;\nvar isNegPrice  = currentPrice < 0;\n\nvar chargeAbsMax    = avgPrice * CFG.CHARGE_ABS_RATIO;\nvar dischargeAbsMin = avgPrice * CFG.DISCHARGE_ABS_RATIO;\n\nvar chargeRatioThreshold    = lastState === 'charging'    ? CFG.CHARGE_THRESHOLD    + CFG.HYSTERESIS : CFG.CHARGE_THRESHOLD;\nvar dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;\n\nvar isPriceLow;\nif (batterySoC < CFG.SOC_CRITICAL && currentPrice < avgPrice) {\n  isPriceLow = true;\n} else if (inChargingWindow === null) {\n  isPriceLow = (priceRatio <= chargeRatioThreshold && currentPrice <= chargeAbsMax) || isNegPrice;\n} else {\n  isPriceLow = inChargingWindow || isNegPrice;\n}\n\nvar isPriceHigh;\nif (msg.inDischargeWindow === true) {\n  isPriceHigh = true;\n} else {\n  isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;\n}\n\nvar canCharge      = batterySoC < CFG.SOC_MAX || isNegPrice;\nvar canChargeSolar = batterySoC < CFG.SOC_MAX;\nvar canDischarge   = batterySoC > CFG.SOC_MIN && batterySoC >= CFG.SOC_DISCHARGE_MIN;\n\nvar phaseL1A            = (phaseL1kW * 1000) / CFG.GRID_VOLTAGE;\nvar phaseL2A            = (phaseL2kW * 1000) / CFG.GRID_VOLTAGE;\nvar phaseL3A            = (phaseL3kW * 1000) / CFG.GRID_VOLTAGE;\nvar maxPhaseLoadA       = Math.max(phaseL1A, phaseL2A, phaseL3A);\nvar worstPhaseHeadroomA = Math.max(0, CFG.GRID_MAX_A_PHASE - maxPhaseLoadA - CFG.SAFETY_MARGIN_A);\nvar gridHeadroomW       = worstPhaseHeadroomA * CFG.GRID_VOLTAGE * 3;\nvar maxChargeFromGridA  = Math.round((gridHeadroomW / CFG.BATTERY_VOLTAGE) * CFG.ROUND_TRIP_EFF);\nvar maxAllowedChargeA   = Math.min(CFG.MAX_AMPS, maxChargeFromGridA);\n\nvar solarSurplusThreshold = lastState === 'charging' ? CFG.SOLAR_SURPLUS_EXIT_W : CFG.SOLAR_SURPLUS_W;\n\nvar CONFIRM_CYCLES = (isPriceLow || isPriceHigh || isNegPrice || (actualSurplusW > solarSurplusThreshold && canChargeSolar)) ? 1 : 2;\n\nvar charging    = false;\nvar discharging = false;\nvar targetAmps  = 0;\nvar reason      = '';\n\nif (isNegPrice && canCharge) {\n  charging   = true;\n  targetAmps = maxAllowedChargeA;\n  reason     = 'Negative price (' + currentPrice.toFixed(3) + ' EUR/kWh) - charging at ' + targetAmps + ' A (worst phase headroom: ' + worstPhaseHeadroomA.toFixed(1) + ' A)';\n\n} else if (isPriceLow && canCharge) {\n  var priceDiscount = 1 - priceRatio;\n  var fraction      = 0.50 + (priceDiscount * 2.5);\n  charging   = true;\n  targetAmps = Math.round(Math.min(maxAllowedChargeA, maxAllowedChargeA * fraction));\n  if (batterySoC < CFG.SOC_CRITICAL) {\n    targetAmps = maxAllowedChargeA;\n    reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';\n  } else {\n    reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';\n  }\n\n} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar) {\n  var surplusAmps = Math.round((actualSurplusW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF);\n  charging   = true;\n  targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);\n  reason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';\n\n} else if (isPriceHigh && canDischarge) {\n  if (dischargeTargetW > 0) {\n    var targetW     = dischargeTargetW + CFG.EXPORT_BIAS_W;\n    var neededAmps  = Math.round((targetW / CFG.BATTERY_VOLTAGE) * CFG.DISCHARGE_OVERSHOOT);\n    var clampedAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, neededAmps));\n    discharging = true;\n    targetAmps  = clampedAmps;\n    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import + ' + CFG.EXPORT_BIAS_W + ' W export bias' + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');\n  } else {\n    discharging = true;\n    targetAmps  = CFG.MIN_DISCHARGE_A;\n    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price (solar export: ' + actualSurplusW.toFixed(0) + ' W)';\n  }\n\n} else {\n  reason = 'Idle - SoC ' + batterySoC + '%, price ' + currentPrice.toFixed(3) + ' EUR (' + (priceRatio * 100).toFixed(0) + '% of avg), solar ' + solarTotalW.toFixed(0) + ' W, netGrid ' + netGridW.toFixed(0) + ' W | ' + (msg.plannerReason || 'no planner');\n}\n\nif (charging && discharging) {\n  discharging = false;\n  reason += ' [conflict resolved: charge wins]';\n}\nif (targetAmps === 0) {\n  charging    = false;\n  discharging = false;\n}\n\ncontext.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');\n\nvar rawState = charging ? 'charging' : discharging ? 'discharging' : 'idle';\nvar confirmedState;\nif (rawState === pendingState) {\n  var newCount = pendingCount + 1;\n  context.set('pendingCount', newCount);\n  if (newCount >= CONFIRM_CYCLES) {\n    confirmedState = rawState;\n    context.set('lastState', rawState);\n  } else {\n    confirmedState = lastState;\n    reason += ' [confirming ' + newCount + '/' + CONFIRM_CYCLES + ']';\n  }\n} else {\n  context.set('pendingState', rawState);\n  context.set('pendingCount', 1);\n  confirmedState = lastState;\n  reason += ' [pending change to ' + rawState + ' 1/' + CONFIRM_CYCLES + ']';\n}\n\ncharging    = confirmedState === 'charging';\ndischarging = confirmedState === 'discharging';\ntargetAmps  = (charging || discharging) ? targetAmps : 0;\n\nif (targetAmps === 0) {\n  charging    = false;\n  discharging = false;\n}\n\nmsg.payload = {\n  version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),\n  dc_amps:     targetAmps,\n  charging:    charging,\n  discharging: discharging,\n  reason:      reason,\n  planner: {\n    inWindow:              msg.inChargingWindow,\n    inDischargeWindow:     msg.inDischargeWindow,\n    dischargeThreshold:    msg.dischargeThreshold || null,\n    hoursNeeded:           msg.hoursNeeded,\n    kwhNeeded:             msg.kwhNeeded,\n    cheapestPrice:         msg.cheapestPrice,\n    plannedHours:          msg.plannedChargeHours,\n    plannedDischargeHours: msg.plannedDischargeHours,\n    reason:                msg.plannerReason\n  },\n  inputs: {\n    currentPrice:        currentPrice,\n    avgPrice:            avgPrice,\n    priceRatio:          parseFloat((priceRatio * 100).toFixed(1)),\n    chargeAbsMax:        parseFloat(chargeAbsMax.toFixed(3)),\n    dischargeAbsMin:     parseFloat(dischargeAbsMin.toFixed(3)),\n    lastState:           lastState,\n    batterySoC:          batterySoC,\n    solarTotal_W:        solarTotalW,\n    netGrid_W:           netGridW,\n    dischargeTarget_W:   dischargeTargetW,\n    actualSurplus_W:     actualSurplusW,\n    phaseL1_A:           parseFloat(phaseL1A.toFixed(2)),\n    phaseL2_A:           parseFloat(phaseL2A.toFixed(2)),\n    phaseL3_A:           parseFloat(phaseL3A.toFixed(2)),\n    maxPhaseLoad_A:      parseFloat(maxPhaseLoadA.toFixed(2)),\n    worstHeadroom_A:     parseFloat(worstPhaseHeadroomA.toFixed(2)),\n    gridHeadroom_W:      parseFloat(gridHeadroomW.toFixed(0)),\n    maxAllowedCharge_A:  maxAllowedChargeA\n  },\n  timestamp: new Date().toISOString()\n};\n\nnode.status({\n  fill:  charging ? 'green' : discharging ? 'red' : 'grey',\n  shape: 'dot',\n  text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'\n});\n\nreturn msg;\n",
     "outputs": 1,
     "timeout": 0,
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 640,
-    "y": 560,
+    "x": 1310,
+    "y": 340,
     "wires": [["split-outputs"]]
   },
+
   {
     "id": "split-outputs",
     "type": "function",
     "z": "ems-tab",
     "name": "Split outputs",
-    "func": "var p = msg.payload;\nvar m1 = { payload: p.dc_amps,     topic: 'battery/dc_amps' };\nvar m2 = { payload: p.charging,    topic: 'battery/charging' };\nvar m3 = { payload: p.discharging, topic: 'battery/discharging' };\nvar m4 = { payload: p,             topic: 'battery/diagnostics' };\nreturn [ m1, m2, m3, m4 ];
+    "func": "var p  = msg.payload;\nvar m1 = { payload: p.dc_amps,     topic: 'battery/dc_amps' };\nvar m2 = { payload: p.charging,    topic: 'battery/charging' };\nvar m3 = { payload: p.discharging, topic: 'battery/discharging' };\nvar m4 = { payload: p,             topic: 'battery/diagnostics' };\nreturn [ m1, m2, m3, m4 ];\n",
+    "outputs": 4,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 110,
+    "y": 500,
+    "wires": [
+      ["set-ha-amps"],
+      ["set-ha-charging"],
+      ["set-ha-discharging"],
+      ["debug-diagnostics"]
+    ]
+  },
+
+  {
+    "id": "set-ha-amps",
+    "type": "api-call-service",
+    "z": "ems-tab",
+    "name": "Set battery_dc_amps",
+    "server": "ha-server",
+    "version": 5,
+    "domain": "input_number",
+    "service": "set_value",
+    "areaId": "",
+    "data": "{\"entity_id\":\"input_number.battery_dc_amps\",\"value\":{{payload}}}",
+    "dataType": "json",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "none",
+    "x": 350,
+    "y": 460,
+    "wires": [[]]
+  },
+
+  {
+    "id": "set-ha-charging",
+    "type": "api-call-service",
+    "z": "ems-tab",
+    "name": "Set battery_charging bool",
+    "server": "ha-server",
+    "version": 5,
+    "domain": "input_boolean",
+    "service": "{{payload ? 'turn_on' : 'turn_off'}}",
+    "areaId": "",
+    "data": "{\"entity_id\":\"input_boolean.battery_charging\"}",
+    "dataType": "json",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "none",
+    "x": 350,
+    "y": 540,
+    "wires": [[]]
+  },
+
+  {
+    "id": "set-ha-discharging",
+    "type": "api-call-service",
+    "z": "ems-tab",
+    "name": "Set battery_discharging bool",
+    "server": "ha-server",
+    "version": 5,
+    "domain": "input_boolean",
+    "service": "{{payload ? 'turn_on' : 'turn_off'}}",
+    "areaId": "",
+    "data": "{\"entity_id\":\"input_boolean.battery_discharging\"}",
+    "dataType": "json",
+    "mergeContext": "",
+    "mustacheAltTags": false,
+    "outputProperties": [],
+    "queue": "none",
+    "x": 350,
+    "y": 620,
+    "wires": [[]]
+  },
+
+  {
+    "id": "debug-diagnostics",
+    "type": "debug",
+    "z": "ems-tab",
+    "name": "EMS Diagnostics",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload.reason",
+    "statusType": "auto",
+    "x": 350,
+    "y": 700,
+    "wires": []
+  }
+]
