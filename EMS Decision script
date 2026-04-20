@@ -1,0 +1,240 @@
+// EMS Decision Engine
+// v3.5 - canDischarge bug fixed (|| SOC_MAX always true), discharge amp calc fixed (removed ROUND_TRIP_EFF from discharge path)
+// v3.4 - all fixed price thresholds replaced with ratios of today's average
+// v3.3 - solar surplus canChargeSolar flag, never blocked by price or SoC threshold
+// v3.2 - solar surplus before discharge, SOC_DISCHARGE_MIN 15%, gross import target
+// v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
+// v3.0 - P1 phase readings used directly
+
+var EMS_VERSION = 'EMS v3.5';
+
+var CFG = {
+  MAX_AMPS:             200,
+  BATTERY_VOLTAGE:      48,
+  BATTERY_KWH:          40,
+  SOC_MIN:              10,
+  SOC_MAX:              95,
+  SOC_DISCHARGE_MIN:    15,
+  SOC_CRITICAL:         20,
+  CHARGE_THRESHOLD:     0.80,
+  DISCHARGE_THRESHOLD:  1.20,
+  CHARGE_ABS_RATIO:     0.55,
+  DISCHARGE_ABS_RATIO:  0.55,
+  DISCHARGE_OVERSHOOT:  1.25,
+  EXPORT_BIAS_W:        800,
+  HYSTERESIS:           0.05,
+  SOLAR_SURPLUS_W:      500,
+  SOLAR_SURPLUS_EXIT_W: 200,
+  ROUND_TRIP_EFF:       0.85,
+  GRID_MAX_A_PHASE:     18,
+  GRID_VOLTAGE:         230,
+  SAFETY_MARGIN_A:      2,
+  MIN_DISCHARGE_A:      35
+};
+
+var currentPrice     = parseFloat(msg.currentPrice) || 0;
+var avgPrice         = parseFloat(msg.avgPrice)     || 0.10;
+var inChargingWindow = msg.inChargingWindow;
+
+var gridImport       = parseFloat(msg.gridImport) || 0;
+var gridExport       = parseFloat(msg.gridExport) || 0;
+var netGridW         = (gridImport - gridExport) * 1000;
+var dischargeTargetW = gridImport * 1000;
+
+var phaseL1kW  = parseFloat(msg.phaseL1)   || 0;
+var phaseL2kW  = parseFloat(msg.phaseL2)   || 0;
+var phaseL3kW  = parseFloat(msg.phaseL3)   || 0;
+var pac1       = parseFloat(msg.pac1)       || 0;
+var pac2       = parseFloat(msg.pac2)       || 0;
+var pac3       = parseFloat(msg.pac3)       || 0;
+var batterySoC = parseFloat(msg.batterySoC) || 50;
+
+var lastState    = context.get('lastState')    || 'idle';
+var pendingState = context.get('pendingState') || 'idle';
+var pendingCount = context.get('pendingCount') || 0;
+
+var solarTotalW    = pac1 + pac2 + pac3;
+var actualSurplusW = (netGridW < 0 && solarTotalW > 50 && Math.abs(netGridW) <= solarTotalW * 1.3) ? Math.abs(netGridW) : 0;
+
+var priceRatio  = avgPrice > 0 ? currentPrice / avgPrice : 1;
+var isNegPrice  = currentPrice < 0;
+
+// Dynamic thresholds based on today's average — no fixed euro amounts
+var chargeAbsMax    = avgPrice * CFG.CHARGE_ABS_RATIO;
+var dischargeAbsMin = avgPrice * CFG.DISCHARGE_ABS_RATIO;
+
+var chargeRatioThreshold    = lastState === 'charging'    ? CFG.CHARGE_THRESHOLD    + CFG.HYSTERESIS : CFG.CHARGE_THRESHOLD;
+var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;
+
+var isPriceLow;
+if (batterySoC < CFG.SOC_CRITICAL && currentPrice < avgPrice) {
+  isPriceLow = true;
+} else if (inChargingWindow === null) {
+  isPriceLow = (priceRatio <= chargeRatioThreshold && currentPrice <= chargeAbsMax) || isNegPrice;
+} else {
+  isPriceLow = inChargingWindow || isNegPrice;
+}
+
+var isPriceHigh;
+if (msg.inDischargeWindow === true) {
+  isPriceHigh = true;
+} else {
+  isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;
+}
+
+var canCharge      = batterySoC < CFG.SOC_MAX || isNegPrice;
+var canChargeSolar = batterySoC < CFG.SOC_MAX;
+// FIX 1: was `(batterySoC > CFG.SOC_MIN || batterySoC > CFG.SOC_MAX) && ...`
+//         `|| batterySoC > CFG.SOC_MAX` is almost never true and the || made the
+//         first condition effectively ignored — now correctly just SOC_MIN guard.
+var canDischarge   = batterySoC > CFG.SOC_MIN && batterySoC >= CFG.SOC_DISCHARGE_MIN;
+
+var phaseL1A            = (phaseL1kW * 1000) / CFG.GRID_VOLTAGE;
+var phaseL2A            = (phaseL2kW * 1000) / CFG.GRID_VOLTAGE;
+var phaseL3A            = (phaseL3kW * 1000) / CFG.GRID_VOLTAGE;
+var maxPhaseLoadA       = Math.max(phaseL1A, phaseL2A, phaseL3A);
+var worstPhaseHeadroomA = Math.max(0, CFG.GRID_MAX_A_PHASE - maxPhaseLoadA - CFG.SAFETY_MARGIN_A);
+var gridHeadroomW       = worstPhaseHeadroomA * CFG.GRID_VOLTAGE * 3;
+var maxChargeFromGridA  = Math.round((gridHeadroomW / CFG.BATTERY_VOLTAGE) * CFG.ROUND_TRIP_EFF);
+var maxAllowedChargeA   = Math.min(CFG.MAX_AMPS, maxChargeFromGridA);
+
+var solarSurplusThreshold = lastState === 'charging' ? CFG.SOLAR_SURPLUS_EXIT_W : CFG.SOLAR_SURPLUS_W;
+
+var CONFIRM_CYCLES = (isPriceLow || isPriceHigh || isNegPrice || (actualSurplusW > solarSurplusThreshold && canChargeSolar)) ? 1 : 2;
+
+var charging    = false;
+var discharging = false;
+var targetAmps  = 0;
+var reason      = '';
+
+if (isNegPrice && canCharge) {
+  charging   = true;
+  targetAmps = maxAllowedChargeA;
+  reason     = 'Negative price (' + currentPrice.toFixed(3) + ' EUR/kWh) - charging at ' + targetAmps + ' A (worst phase headroom: ' + worstPhaseHeadroomA.toFixed(1) + ' A)';
+
+} else if (isPriceLow && canCharge) {
+  var priceDiscount = 1 - priceRatio;
+  var fraction      = 0.50 + (priceDiscount * 2.5);
+  charging   = true;
+  targetAmps = Math.round(Math.min(maxAllowedChargeA, maxAllowedChargeA * fraction));
+  if (batterySoC < CFG.SOC_CRITICAL) {
+    targetAmps = maxAllowedChargeA;
+    reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
+  } else {
+    reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
+  }
+
+} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar) {
+  var surplusAmps = Math.round((actualSurplusW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF);
+  charging   = true;
+  targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);
+  reason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';
+
+} else if (isPriceHigh && canDischarge) {
+  if (dischargeTargetW > 0) {
+    var targetW = dischargeTargetW + CFG.EXPORT_BIAS_W;
+    // FIX 2: removed / CFG.ROUND_TRIP_EFF — efficiency applies to charging only.
+    //         discharge amps = DC watts needed ÷ DC bus voltage, then overshoot for lag.
+    //         old formula inflated amps by factor of (OVERSHOOT / EFF) = 1.25/0.85 = ~1.47×
+    //         new formula: (targetW / VOLTAGE) * OVERSHOOT only
+    var neededAmps  = Math.round((targetW / CFG.BATTERY_VOLTAGE) * CFG.DISCHARGE_OVERSHOOT);
+    var clampedAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, neededAmps));
+    discharging = true;
+    targetAmps  = clampedAmps;
+    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import + ' + CFG.EXPORT_BIAS_W + ' W export bias' + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
+  } else {
+    discharging = true;
+    targetAmps  = CFG.MIN_DISCHARGE_A;
+    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price (solar export: ' + actualSurplusW.toFixed(0) + ' W)';
+  }
+
+} else {
+  reason = 'Idle - SoC ' + batterySoC + '%, price ' + currentPrice.toFixed(3) + ' EUR (' + (priceRatio * 100).toFixed(0) + '% of avg), solar ' + solarTotalW.toFixed(0) + ' W, netGrid ' + netGridW.toFixed(0) + ' W | ' + (msg.plannerReason || 'no planner');
+}
+
+if (charging && discharging) {
+  discharging = false;
+  reason += ' [conflict resolved: charge wins]';
+}
+if (targetAmps === 0) {
+  charging    = false;
+  discharging = false;
+}
+
+context.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');
+
+var rawState = charging ? 'charging' : discharging ? 'discharging' : 'idle';
+var confirmedState;
+if (rawState === pendingState) {
+  var newCount = pendingCount + 1;
+  context.set('pendingCount', newCount);
+  if (newCount >= CONFIRM_CYCLES) {
+    confirmedState = rawState;
+    context.set('lastState', rawState);
+  } else {
+    confirmedState = lastState;
+    reason += ' [confirming ' + newCount + '/' + CONFIRM_CYCLES + ']';
+  }
+} else {
+  context.set('pendingState', rawState);
+  context.set('pendingCount', 1);
+  confirmedState = lastState;
+  reason += ' [pending change to ' + rawState + ' 1/' + CONFIRM_CYCLES + ']';
+}
+
+charging    = confirmedState === 'charging';
+discharging = confirmedState === 'discharging';
+targetAmps  = (charging || discharging) ? targetAmps : 0;
+
+if (targetAmps === 0) {
+  charging    = false;
+  discharging = false;
+}
+
+msg.payload = {
+  version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),
+  dc_amps:     targetAmps,
+  charging:    charging,
+  discharging: discharging,
+  reason:      reason,
+  planner: {
+    inWindow:              msg.inChargingWindow,
+    inDischargeWindow:     msg.inDischargeWindow,
+    dischargeThreshold:    msg.dischargeThreshold || null,
+    hoursNeeded:           msg.hoursNeeded,
+    kwhNeeded:             msg.kwhNeeded,
+    cheapestPrice:         msg.cheapestPrice,
+    plannedHours:          msg.plannedChargeHours,
+    plannedDischargeHours: msg.plannedDischargeHours,
+    reason:                msg.plannerReason
+  },
+  inputs: {
+    currentPrice:        currentPrice,
+    avgPrice:            avgPrice,
+    priceRatio:          parseFloat((priceRatio * 100).toFixed(1)),
+    chargeAbsMax:        parseFloat(chargeAbsMax.toFixed(3)),
+    dischargeAbsMin:     parseFloat(dischargeAbsMin.toFixed(3)),
+    lastState:           lastState,
+    batterySoC:          batterySoC,
+    solarTotal_W:        solarTotalW,
+    netGrid_W:           netGridW,
+    dischargeTarget_W:   dischargeTargetW,
+    actualSurplus_W:     actualSurplusW,
+    phaseL1_A:           parseFloat(phaseL1A.toFixed(2)),
+    phaseL2_A:           parseFloat(phaseL2A.toFixed(2)),
+    phaseL3_A:           parseFloat(phaseL3A.toFixed(2)),
+    maxPhaseLoad_A:      parseFloat(maxPhaseLoadA.toFixed(2)),
+    worstHeadroom_A:     parseFloat(worstPhaseHeadroomA.toFixed(2)),
+    gridHeadroom_W:      parseFloat(gridHeadroomW.toFixed(0)),
+    maxAllowedCharge_A:  maxAllowedChargeA
+  },
+  timestamp: new Date().toISOString()
+};
+
+node.status({
+  fill:  charging ? 'green' : discharging ? 'red' : 'grey',
+  shape: 'dot',
+  text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
+});
+
+return msg;
