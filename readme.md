@@ -10,6 +10,21 @@ Install in Node-RED via **Manage palette**:
 
 ---
 
+## Home Assistant Integrations
+
+All integrations listed below must be installed and working in Home Assistant before the EMS flow can function. The entity names in the flow are derived from these integrations.
+
+| Integration | Source | Purpose in EMS |
+|---|---|---|
+| **Frank Energie** | [github.com/HiDiHo01/home-assistant-frank_energie](https://github.com/HiDiHo01/home-assistant-frank_energie) | Hourly dynamic electricity prices — primary price source for planner and EMS |
+| **DSMR Smart Meter** | [home-assistant.io/integrations/dsmr](https://www.home-assistant.io/integrations/dsmr/) | Real-time grid import/export (kW) and per-phase load (kW) via P1 port |
+| **Growatt ESPHome** | [github.com/WaarlandIT/ESPHOME-Growatt](https://github.com/WaarlandIT/ESPHOME-Growatt) | Live solar AC output per phase (PAC1/2/3 in W) |
+| **Forecast.Solar** | [home-assistant.io/integrations/forecast_solar](https://www.home-assistant.io/integrations/forecast_solar/) | Solar production forecast — available for future enhancements |
+| **ha-solarman** | [github.com/davidrapan/ha-solarman](https://github.com/davidrapan/ha-solarman) | Battery state of charge (%) from BMS via Solarman protocol |
+| **EnergyZero** | [home-assistant.io/integrations/energyzero](https://www.home-assistant.io/integrations/energyzero/) | Used only as an hourly trigger (price hour change node) — not the price source |
+
+> **Note:** Frank Energie is the authoritative price source since Planner v2.4. EnergyZero is kept only as a trigger entity to fire the flow at the start of each new price hour.
+
 ## Step 1 – Home Assistant Helpers
 
 Create these in **Settings → Devices & Services → Helpers** before importing the flow:
@@ -28,14 +43,14 @@ These are the three outputs the EMS writes every cycle. Your battery inverter in
 
 Verify these in the relevant `api-current-state` nodes after importing. Use **Developer Tools → States** to find your exact entity names.
 
-### Frank Energie (price source)
+### Frank Energie (price source) — [GitHub](https://github.com/HiDiHo01/home-assistant-frank_energie)
 | Node | Entity ID | Output |
 |---|---|---|
 | Frank Energie prijzen | `sensor.frank_energie_prijzen_huidige_elektriciteitsprijs_all_in` | `msg.frankPrices` (attributes.prices array) |
 
 > The planner calculates `currentPrice` and `avgPrice` directly from this array and writes them to `msg`, overriding anything from EnergyZero. EnergyZero is only used as an hourly trigger, not as a price source.
 
-### DSMR Smart Meter
+### DSMR Smart Meter — [HA Docs](https://www.home-assistant.io/integrations/dsmr/)
 | Node | Entity ID | Output |
 |---|---|---|
 | Grid import kW | `sensor.dsmr_reading_electricity_currently_delivered` | `msg.gridImport` (kW) |
@@ -46,7 +61,7 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
 
 > Entity names vary by DSMR version. Search `dsmr` in Developer Tools → States to confirm yours.
 
-### Growatt Solar (AC output per phase)
+### Growatt Solar (AC output per phase) — [GitHub](https://github.com/WaarlandIT/ESPHOME-Growatt)
 | Node | Entity ID | Output |
 |---|---|---|
 | Solar PAC1 W | `sensor.growatt_pac1` | `msg.pac1` |
@@ -55,14 +70,14 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
 
 > AC watts per phase from the Growatt ESPHome integration. Summed as `solarTotalW = pac1 + pac2 + pac3`.
 
-### Battery
+### Battery SoC — [ha-solarman GitHub](https://github.com/davidrapan/ha-solarman)
 | Node | Entity ID | Output |
 |---|---|---|
 | Battery SoC | `sensor.battery_state_of_charge` | `msg.batterySoC` (%) |
 
 > Replace with your actual BMS/inverter SoC entity.
 
-### Trigger nodes (state-changed, not current-state)
+### Trigger nodes — [EnergyZero HA Docs](https://www.home-assistant.io/integrations/energyzero/)
 | Node | Entity ID | Purpose |
 |---|---|---|
 | DSMR power change | `sensor.electricity_meter_energieverbruik` | Fire instantly on load change |
