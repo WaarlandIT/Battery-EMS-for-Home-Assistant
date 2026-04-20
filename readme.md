@@ -1,6 +1,8 @@
 # Battery EMS – Node-RED Setup & Reference Guide
 **EMS v3.5 / Planner v2.5** — Updated 20 April 2026
 
+The EMS decision script and Price Planner are included in the JSON but when these scripts have updates (bug fixes) the JSON will not get updated. 
+
 ---
 
 ## My Setup
