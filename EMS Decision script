@@ -1,4 +1,9 @@
 // EMS Decision Engine
+// v3.7 - isPriceLow: planner window can now be overridden by ratio threshold;
+//         dramatically cheap hours (price <= CHARGE_THRESHOLD × avg) always charge
+//         regardless of planned window, so cheap hours outside the window aren't wasted
+// v3.6 - SOC_CRITICAL check changed < to <= (was missing boundary at exactly 20%);
+//         isPriceHigh now also guards currentPrice >= avgPrice to prevent discharging below avg
 // v3.5 - canDischarge bug fixed (|| SOC_MAX always true), discharge amp calc fixed (removed ROUND_TRIP_EFF from discharge path)
 // v3.4 - all fixed price thresholds replaced with ratios of today's average
 // v3.3 - solar surplus canChargeSolar flag, never blocked by price or SoC threshold
@@ -6,7 +11,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.5';
+var EMS_VERSION = 'EMS v3.7';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -67,17 +72,24 @@ var chargeRatioThreshold    = lastState === 'charging'    ? CFG.CHARGE_THRESHOLD
 var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;
 
 var isPriceLow;
-if (batterySoC < CFG.SOC_CRITICAL && currentPrice < avgPrice) {
+var isPriceVeryLow = priceRatio <= CFG.CHARGE_THRESHOLD && currentPrice <= chargeAbsMax;  // ratio override
+if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice) {
+  // Critical SoC — charge in any below-average hour regardless of window
   isPriceLow = true;
 } else if (inChargingWindow === null) {
-  isPriceLow = (priceRatio <= chargeRatioThreshold && currentPrice <= chargeAbsMax) || isNegPrice;
+  // No planner data — use ratio fallback
+  isPriceLow = isPriceVeryLow || isNegPrice;
 } else {
-  isPriceLow = inChargingWindow || isNegPrice;
+  // Planner active — trust the window, but also charge if price is dramatically cheap
+  // regardless of whether this hour was planned. Prevents wasting low-price hours
+  // that fall outside the centered window (e.g. a cheap morning dip before 12h).
+  isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice;
 }
 
 var isPriceHigh;
 if (msg.inDischargeWindow === true) {
-  isPriceHigh = true;
+  // FIX: guard against planner flagging discharge hours below avg price
+  isPriceHigh = currentPrice >= avgPrice && currentPrice >= dischargeAbsMin;
 } else {
   isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;
 }
@@ -120,8 +132,10 @@ if (isNegPrice && canCharge) {
   if (batterySoC < CFG.SOC_CRITICAL) {
     targetAmps = maxAllowedChargeA;
     reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
-  } else {
+  } else if (inChargingWindow) {
     reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
+  } else {
+    reason     = 'Price override: ' + Math.round(priceRatio * 100) + '% of avg (' + currentPrice.toFixed(3) + ' EUR) below threshold - charging at ' + targetAmps + ' A outside planned window';
   }
 
 } else if (actualSurplusW > solarSurplusThreshold && canChargeSolar) {
