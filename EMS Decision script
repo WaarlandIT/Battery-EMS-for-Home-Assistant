@@ -1,4 +1,6 @@
 // EMS Decision Engine
+// v3.8 - SOC_CRITICAL branch now also requires price <= chargeAbsMax (avg × 0.55);
+//         prevents emergency charging at above-average prices when avgPrice is skewed early morning
 // v3.7 - isPriceLow: planner window can now be overridden by ratio threshold;
 //         dramatically cheap hours (price <= CHARGE_THRESHOLD × avg) always charge
 //         regardless of planned window, so cheap hours outside the window aren't wasted
@@ -11,7 +13,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.7';
+var EMS_VERSION = 'EMS v3.8';
 
 var CFG = {
   MAX_AMPS:             200,
