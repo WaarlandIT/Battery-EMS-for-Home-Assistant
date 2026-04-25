@@ -1,4 +1,5 @@
 // EMS Decision Engine
+// v3.9 - canCharge: removed isNegPrice override on SOC_MAX; battery never charges above 95%
 // v3.8 - SOC_CRITICAL branch now also requires price <= chargeAbsMax (avg × 0.55);
 //         prevents emergency charging at above-average prices when avgPrice is skewed early morning
 // v3.7 - isPriceLow: planner window can now be overridden by ratio threshold;
@@ -13,7 +14,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.8';
+var EMS_VERSION = 'EMS v3.9';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -96,7 +97,7 @@ if (msg.inDischargeWindow === true) {
   isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;
 }
 
-var canCharge      = batterySoC < CFG.SOC_MAX || isNegPrice;
+var canCharge      = batterySoC < CFG.SOC_MAX;  // FIX: removed isNegPrice override — never charge above SOC_MAX regardless of price
 var canChargeSolar = batterySoC < CFG.SOC_MAX;
 // FIX 1: was `(batterySoC > CFG.SOC_MIN || batterySoC > CFG.SOC_MAX) && ...`
 //         `|| batterySoC > CFG.SOC_MAX` is almost never true and the || made the
