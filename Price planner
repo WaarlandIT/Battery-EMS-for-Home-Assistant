@@ -1,4 +1,6 @@
 // Price Planner
+// v2.9 - charge window expansion biased toward earlier hours when neighbour prices
+//         are within EARLY_BIAS_EUR of each other; keeps grid charging before solar peak
 // v2.8 - solar forecast (energy_production_remaining_today) deducted from kwhNeeded;
 //         grid charge window shrinks when solar will cover part of the charge
 // v2.7 - discharge band filter raised to avgPrice (hours below avg can never be discharge hours)
@@ -11,7 +13,7 @@
 // v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected
 // v2.0 - dischargeThreshold recalculated after conflict filter
 
-var PLANNER_VERSION      = 'v2.8';
+var PLANNER_VERSION      = 'v2.9';
 var BATTERY_KWH          = 40;
 var BATTERY_VOLTAGE      = 48;
 var MAX_AMPS             = 200;
@@ -23,6 +25,7 @@ var SOC_NORMAL_THRESHOLD = 80;    // above this, use tight charge cap
 var CHARGE_ABS_RATIO     = 0.55;  // tight cap = avg * this (mirrors EMS v3.4)
 var DISCHARGE_ABS_RATIO  = 0.55;  // min discharge price = avg * this (mirrors EMS v3.4)
 var SOLAR_FORECAST_EFF   = 0.90;  // how much of the solar forecast actually reaches the battery
+var EARLY_BIAS_EUR       = 0.02;  // prefer earlier hour when price difference is within this margin
 
 var maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;
 
@@ -151,8 +154,17 @@ while (windowIndices.length < hoursNeeded) {
   if      (!canRight) { pickLeft = true; }
   else if (!canLeft)  { pickLeft = false; }
   else {
-    // Pick the cheaper neighbour; ties go left (earlier is better)
-    pickLeft = remainingToday[left].price <= remainingToday[right].price;
+    var leftPrice  = remainingToday[left].price;
+    var rightPrice = remainingToday[right].price;
+    var priceDiff  = rightPrice - leftPrice;  // positive = right is more expensive
+    if (priceDiff >= -EARLY_BIAS_EUR) {
+      // Right is more expensive, same price, or only marginally cheaper than left:
+      // prefer left (earlier hour) — keeps grid charging before solar peak.
+      // Only pick right when it is cheaper by more than the bias margin.
+      pickLeft = true;
+    } else {
+      pickLeft = false;
+    }
   }
 
   if (pickLeft) { windowIndices.push(left);  left--;  }
