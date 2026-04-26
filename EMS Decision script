@@ -1,4 +1,8 @@
 // EMS Decision Engine
+// v3.13 - fraction clamped to [0.1, 1.0] in scaled charge calc;
+//          prevents negative dc_amps when priceRatio > 1 (price above avg)
+// v3.12 - pre-discharge before upcoming negative price windows;
+//          discharge to SOC_DISCHARGE_MIN when negative prices are forecast ahead
 // v3.11 - negative price branch: solar production offsets grid draw;
 //          target netGrid ~0 by reducing charge amps by solar available for battery
 // v3.10 - negative price charging spread across full negative window;
@@ -18,7 +22,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.11';
+var EMS_VERSION = 'EMS v3.13';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -62,7 +66,10 @@ var pac2       = parseFloat(msg.pac2)       || 0;
 var pac3       = parseFloat(msg.pac3)       || 0;
 var batterySoC = parseFloat(msg.batterySoC) || 50;
 
-var negPriceHoursRemaining = parseInt(msg.negPriceHoursRemaining) || 1;
+var negPriceHoursRemaining  = parseInt(msg.negPriceHoursRemaining)  || 1;
+var inPreDischargeWindow    = msg.inPreDischargeWindow === true;
+var hoursUntilNegWindow     = parseFloat(msg.hoursUntilNegWindow) || 99;
+var futureNegHoursCount     = parseInt(msg.futureNegHoursCount)   || 0;
 
 var lastState    = context.get('lastState')    || 'idle';
 var pendingState = context.get('pendingState') || 'idle';
@@ -160,9 +167,9 @@ if (isNegPrice && canCharge) {
 
 } else if (isPriceLow && canCharge) {
   var priceDiscount = 1 - priceRatio;
-  var fraction      = 0.50 + (priceDiscount * 2.5);
+  var fraction      = Math.max(0.10, Math.min(1.0, 0.50 + (priceDiscount * 2.5)));  // FIX: clamp prevents negative amps when price > avg
   charging   = true;
-  targetAmps = Math.round(Math.min(maxAllowedChargeA, maxAllowedChargeA * fraction));
+  targetAmps = Math.round(maxAllowedChargeA * fraction);
   if (batterySoC < CFG.SOC_CRITICAL) {
     targetAmps = maxAllowedChargeA;
     reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
@@ -177,6 +184,23 @@ if (isNegPrice && canCharge) {
   charging   = true;
   targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);
   reason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';
+
+} else if (inPreDischargeWindow && canDischarge) {
+  // Pre-discharge: negative price window is coming — empty the battery now to free
+  // capacity for cheap/free charging. Discharge at a rate that reaches SOC_DISCHARGE_MIN
+  // just before the negative window starts, spread across available pre-discharge hours.
+  var preDischargeHoursCount = (msg.preDischargeHours || []).length || 1;
+  var currentKwhPD   = CFG.BATTERY_KWH * ((batterySoC - CFG.SOC_MIN) / 100);
+  var minKwhPD       = CFG.BATTERY_KWH * ((CFG.SOC_DISCHARGE_MIN - CFG.SOC_MIN) / 100);
+  var kwhToDischarge = Math.max(0, currentKwhPD - minKwhPD);
+  var targetKwPD     = kwhToDischarge / preDischargeHoursCount;
+  var preAmps        = Math.round((targetKwPD * 1000) / CFG.BATTERY_VOLTAGE);
+  var clampedPreAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, preAmps));
+  discharging = true;
+  targetAmps  = clampedPreAmps;
+  reason      = 'Pre-discharge: neg price in ' + hoursUntilNegWindow + 'h (' + futureNegHoursCount + ' neg hour(s))'
+              + ' - discharging ' + targetAmps + ' A to free ' + kwhToDischarge.toFixed(1) + ' kWh'
+              + ' over ' + preDischargeHoursCount + 'h (SoC ' + batterySoC + '% → ' + CFG.SOC_DISCHARGE_MIN + '%)';
 
 } else if (isPriceHigh && canDischarge) {
   if (dischargeTargetW > 0) {
