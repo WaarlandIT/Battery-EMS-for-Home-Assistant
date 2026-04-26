@@ -1,4 +1,8 @@
 // Price Planner
+// v2.12 - charge window only built when cheapestPrice <= chargePriceCap;
+//          prevents building a window around expensive hours at night
+// v2.11 - pre-discharge before upcoming negative price windows;
+//          if negative prices are forecast ahead, discharge now to free capacity
 // v2.10 - count remaining negative price hours and pass to EMS so negative
 //          price charging is spread across the full negative window instead of max rate
 // v2.9 - charge window expansion biased toward earlier hours when neighbour prices
@@ -15,7 +19,7 @@
 // v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected
 // v2.0 - dischargeThreshold recalculated after conflict filter
 
-var PLANNER_VERSION      = 'v2.10';
+var PLANNER_VERSION      = 'v2.12';
 var BATTERY_KWH          = 40;
 var BATTERY_VOLTAGE      = 48;
 var MAX_AMPS             = 200;
@@ -67,6 +71,10 @@ if (!prices || prices.length === 0) {
   msg.solarForecastKwh      = parseFloat(solarUsableKwh.toFixed(2));
   msg.cheapestPrice              = null;
   msg.negPriceHoursRemaining     = 0;
+  msg.inPreDischargeWindow       = false;
+  msg.preDischargeHours          = [];
+  msg.hoursUntilNegWindow        = null;
+  msg.futureNegHoursCount        = 0;
   msg.plannerReason              = 'No price schedule available - using ratio fallback';
   node.status({ fill: 'yellow', shape: 'dot', text: PLANNER_VERSION + ' No price data - fallback mode' });
   return msg;
@@ -129,6 +137,51 @@ for (var np = 0; np < remainingToday.length; np++) {
   if (remainingToday[np].price < 0) negPriceHoursRemaining++;
 }
 
+// Detect upcoming negative price hours for pre-discharge strategy.
+// If negative prices are coming later today, we want to discharge the battery
+// now (at the best current price) to free up capacity for negative price charging.
+var now2 = new Date();
+var currentHourVal = now2.getHours();
+var futureNegHours = [];         // negative price hours still in the future (not current hour)
+var firstNegHourIdx = -1;        // index in remainingToday of first future negative hour
+
+for (var fn = 0; fn < remainingToday.length; fn++) {
+  if (remainingToday[fn].price < 0 && remainingToday[fn].localHour > currentHourVal) {
+    futureNegHours.push(remainingToday[fn]);
+    if (firstNegHourIdx === -1) firstNegHourIdx = fn;
+  }
+}
+
+var hoursUntilNegWindow = firstNegHourIdx !== -1
+  ? remainingToday[firstNegHourIdx].localHour - currentHourVal
+  : 99;
+
+// How much capacity can we free by discharging to SOC_DISCHARGE_MIN?
+var SOC_DISCHARGE_MIN_LOCAL = 15;
+var currentKwhForDischarge  = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);
+var minKwh                  = BATTERY_KWH * ((SOC_DISCHARGE_MIN_LOCAL - SOC_MIN) / 100);
+var capacityToFree          = Math.max(0, currentKwhForDischarge - minKwh);
+
+// Pre-discharge window: hours between now and the negative window where price > dischargeAbsMin
+// We only pre-discharge in hours that are worth discharging (above avg × DISCHARGE_ABS_RATIO)
+var preDischargeHours = [];
+if (futureNegHours.length > 0 && hoursUntilNegWindow > 0 && hoursUntilNegWindow < 99) {
+  for (var pd = 0; pd < remainingToday.length; pd++) {
+    var pdHour = remainingToday[pd];
+    // Only hours before the negative window, above dischargeAbsMin, and not already negative
+    if (pdHour.localHour < futureNegHours[0].localHour
+        && pdHour.price >= avgPriceCalc * DISCHARGE_ABS_RATIO
+        && pdHour.price >= 0) {
+      preDischargeHours.push(pdHour.localHour);
+    }
+  }
+}
+
+var inPreDischargeWindow = preDischargeHours.indexOf(currentHourVal) !== -1
+  && futureNegHours.length > 0
+  && batterySoC > SOC_DISCHARGE_MIN_LOCAL
+  && capacityToFree > 0;
+
 // Sort remaining by price ascending to find cheapest hour
 var planPrices = remainingToday.slice();
 planPrices.sort(function(a, b) { return a.price - b.price; });
@@ -185,7 +238,14 @@ for (var wi = 0; wi < windowIndices.length; wi++) {
   cheapestHours.push(remainingToday[windowIndices[wi]].localHour);
 }
 
-var inWindow = cheapestHours.indexOf(currentHour) !== -1;
+// Only build a charge window if the cheapest available hour is actually below
+// the price cap. If all remaining hours are expensive (e.g. late evening),
+// no charge window is set — the EMS falls back to ratio-based logic only.
+var chargeWindowValid = cheapestPrice !== null && cheapestPrice <= chargePriceCap;
+if (!chargeWindowValid) {
+  cheapestHours = [];
+}
+var inWindow = chargeWindowValid && cheapestHours.indexOf(currentHour) !== -1;
 
 // Select discharge hours: expensive shoulder bands (morning + evening)
 var morningBand = [];
@@ -258,6 +318,10 @@ msg.hoursNeeded           = hoursNeeded;
 msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));
 msg.cheapestPrice              = cheapestPrice;
   msg.negPriceHoursRemaining     = negPriceHoursRemaining;
+  msg.inPreDischargeWindow       = inPreDischargeWindow;
+  msg.preDischargeHours          = preDischargeHours;
+  msg.hoursUntilNegWindow        = hoursUntilNegWindow < 99 ? hoursUntilNegWindow : null;
+  msg.futureNegHoursCount        = futureNegHours.length;
 msg.plannerReason         =
   'Need ' + kwhNeeded.toFixed(1) + ' kWh total' +
     (solarUsableKwh > 0 ? ', solar covers ~' + solarUsableKwh.toFixed(1) + ' kWh, ' + kwhFromGrid.toFixed(1) + ' kWh from grid (' + hoursNeeded + 'h)' : ' from grid (' + hoursNeeded + 'h)') + '. ' +
@@ -267,7 +331,8 @@ msg.plannerReason         =
   '. Discharge hours: ' + expensiveHours.map(function(h) { return h + 'h'; }).join(', ') +
   '. Discharge threshold: ' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +
   '. In charge window: ' + inWindow +
-  '. In discharge window: ' + inDischargeWindow;
+  '. In discharge window: ' + inDischargeWindow +
+  (futureNegHours.length > 0 ? '. Neg price in ' + (hoursUntilNegWindow < 99 ? hoursUntilNegWindow + 'h' : '?') + ' (' + futureNegHours.length + ' neg hour(s)). Pre-discharge: ' + inPreDischargeWindow : '');
 
 node.status({
   fill:  inWindow ? 'green' : inDischargeWindow ? 'red' : 'grey',
