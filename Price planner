@@ -1,4 +1,6 @@
 // Price Planner
+// v2.10 - count remaining negative price hours and pass to EMS so negative
+//          price charging is spread across the full negative window instead of max rate
 // v2.9 - charge window expansion biased toward earlier hours when neighbour prices
 //         are within EARLY_BIAS_EUR of each other; keeps grid charging before solar peak
 // v2.8 - solar forecast (energy_production_remaining_today) deducted from kwhNeeded;
@@ -13,7 +15,7 @@
 // v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected
 // v2.0 - dischargeThreshold recalculated after conflict filter
 
-var PLANNER_VERSION      = 'v2.9';
+var PLANNER_VERSION      = 'v2.10';
 var BATTERY_KWH          = 40;
 var BATTERY_VOLTAGE      = 48;
 var MAX_AMPS             = 200;
@@ -63,8 +65,9 @@ if (!prices || prices.length === 0) {
   msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));
   msg.kwhFromGrid           = parseFloat(kwhFromGrid.toFixed(2));
   msg.solarForecastKwh      = parseFloat(solarUsableKwh.toFixed(2));
-  msg.cheapestPrice         = null;
-  msg.plannerReason         = 'No price schedule available - using ratio fallback';
+  msg.cheapestPrice              = null;
+  msg.negPriceHoursRemaining     = 0;
+  msg.plannerReason              = 'No price schedule available - using ratio fallback';
   node.status({ fill: 'yellow', shape: 'dot', text: PLANNER_VERSION + ' No price data - fallback mode' });
   return msg;
 }
@@ -118,6 +121,12 @@ for (var r = 0; r < allParsed.length; r++) {
   if (allParsed[r].dateStr === localDateStr && allParsed[r].till > now) {
     remainingToday.push(allParsed[r]);
   }
+}
+
+// Count remaining hours with negative price — used by EMS to spread charge rate
+var negPriceHoursRemaining = 0;
+for (var np = 0; np < remainingToday.length; np++) {
+  if (remainingToday[np].price < 0) negPriceHoursRemaining++;
 }
 
 // Sort remaining by price ascending to find cheapest hour
@@ -247,7 +256,8 @@ msg.plannedChargeHours    = cheapestHours;
 msg.plannedDischargeHours = expensiveHours;
 msg.hoursNeeded           = hoursNeeded;
 msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));
-msg.cheapestPrice         = cheapestPrice;
+msg.cheapestPrice              = cheapestPrice;
+  msg.negPriceHoursRemaining     = negPriceHoursRemaining;
 msg.plannerReason         =
   'Need ' + kwhNeeded.toFixed(1) + ' kWh total' +
     (solarUsableKwh > 0 ? ', solar covers ~' + solarUsableKwh.toFixed(1) + ' kWh, ' + kwhFromGrid.toFixed(1) + ' kWh from grid (' + hoursNeeded + 'h)' : ' from grid (' + hoursNeeded + 'h)') + '. ' +
