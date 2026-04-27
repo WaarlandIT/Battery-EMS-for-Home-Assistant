@@ -1,4 +1,6 @@
 // Price Planner
+// v2.13 - discharge window centered on most expensive hour and expanded outward;
+//          window size based on actual kWh available to discharge at max rate
 // v2.12 - charge window only built when cheapestPrice <= chargePriceCap;
 //          prevents building a window around expensive hours at night
 // v2.11 - pre-discharge before upcoming negative price windows;
@@ -19,7 +21,7 @@
 // v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected
 // v2.0 - dischargeThreshold recalculated after conflict filter
 
-var PLANNER_VERSION      = 'v2.12';
+var PLANNER_VERSION      = 'v2.13';
 var BATTERY_KWH          = 40;
 var BATTERY_VOLTAGE      = 48;
 var MAX_AMPS             = 200;
@@ -32,6 +34,10 @@ var CHARGE_ABS_RATIO     = 0.55;  // tight cap = avg * this (mirrors EMS v3.4)
 var DISCHARGE_ABS_RATIO  = 0.55;  // min discharge price = avg * this (mirrors EMS v3.4)
 var SOLAR_FORECAST_EFF   = 0.90;  // how much of the solar forecast actually reaches the battery
 var EARLY_BIAS_EUR       = 0.02;  // prefer earlier hour when price difference is within this margin
+var LATE_BIAS_EUR        = 0.02;  // prefer later hour when discharge neighbour prices are within this margin
+var MAX_DISCHARGE_KW     = 9.6;   // MAX_AMPS x BATTERY_VOLTAGE / 1000
+var SOC_DISCHARGE_MAX    = 95;    // SoC from which discharge starts
+var SOC_DISCHARGE_MIN_PL = 15;    // SoC floor for discharge
 
 var maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;
 
@@ -247,58 +253,73 @@ if (!chargeWindowValid) {
 }
 var inWindow = chargeWindowValid && cheapestHours.indexOf(currentHour) !== -1;
 
-// Select discharge hours: expensive shoulder bands (morning + evening)
-var morningBand = [];
-var eveningBand = [];
-for (var m = 0; m < remainingToday.length; m++) {
-  var ph = remainingToday[m];
-  // FIX: was dischargeAbsMin (avg*0.55) — any hour below avg should never be a discharge hour
-  if (ph.price >= avgPriceCalc) {
-    if (ph.localHour >= 6 && ph.localHour <= 11) {
-      morningBand.push(ph);
-    } else if (ph.localHour >= 16 && ph.localHour <= 23) {
-      eveningBand.push(ph);
+// Calculate discharge window size from actual kWh available
+var kwhToDischarge       = BATTERY_KWH * ((SOC_DISCHARGE_MAX - SOC_DISCHARGE_MIN_PL) / 100);
+var dischargeHoursNeeded = Math.min(Math.ceil(kwhToDischarge / MAX_DISCHARGE_KW) + 1, remainingToday.length);
+
+// Find most expensive remaining hour (above avgPrice) as window center
+var dischargePool = [];
+for (var dp = 0; dp < remainingToday.length; dp++) {
+  if (remainingToday[dp].price >= avgPriceCalc) {
+    dischargePool.push(remainingToday[dp]);
+  }
+}
+dischargePool.sort(function(a, b) { return b.price - a.price; });
+
+var expensiveHours     = [];
+var dischargeThreshold = null;
+
+if (dischargePool.length > 0) {
+  var mostExpensiveHour = dischargePool[0].localHour;
+
+  var dCenterIdx = 0;
+  for (var dc = 0; dc < remainingToday.length; dc++) {
+    if (remainingToday[dc].localHour === mostExpensiveHour) { dCenterIdx = dc; break; }
+  }
+
+  // Expand outward from most expensive hour.
+  // LATE_BIAS_EUR: when neighbours are within margin, prefer the later hour
+  // to keep the window anchored in the evening peak band.
+  var dWindowIdx = [dCenterIdx];
+  var dLeft  = dCenterIdx - 1;
+  var dRight = dCenterIdx + 1;
+
+  while (dWindowIdx.length < dischargeHoursNeeded) {
+    var dCanLeft  = dLeft  >= 0                    && remainingToday[dLeft].price  >= avgPriceCalc;
+    var dCanRight = dRight < remainingToday.length && remainingToday[dRight].price >= avgPriceCalc;
+    if (!dCanLeft && !dCanRight) break;
+
+    var dPickLeft;
+    if      (!dCanRight) { dPickLeft = true; }
+    else if (!dCanLeft)  { dPickLeft = false; }
+    else {
+      var dDiff = remainingToday[dLeft].price - remainingToday[dRight].price;
+      dPickLeft = dDiff > LATE_BIAS_EUR;  // only pick left if meaningfully more expensive
+    }
+
+    if (dPickLeft) { dWindowIdx.push(dLeft);  dLeft--;  }
+    else           { dWindowIdx.push(dRight); dRight++; }
+  }
+
+  for (var dw = 0; dw < dWindowIdx.length; dw++) {
+    expensiveHours.push(remainingToday[dWindowIdx[dw]].localHour);
+  }
+
+  // Remove hours conflicting with charge window
+  var filteredDischargeHours = [];
+  for (var fd = 0; fd < expensiveHours.length; fd++) {
+    if (cheapestHours.indexOf(expensiveHours[fd]) === -1) {
+      filteredDischargeHours.push(expensiveHours[fd]);
     }
   }
-}
+  expensiveHours = filteredDischargeHours;
 
-morningBand.sort(function(a, b) { return b.price - a.price; });
-eveningBand.sort(function(a, b) { return b.price - a.price; });
-
-var morningCount   = Math.ceil(morningBand.length * 0.50);
-var eveningCount   = Math.ceil(eveningBand.length * 0.50);
-var expensiveSlots = morningBand.slice(0, morningCount).concat(eveningBand.slice(0, eveningCount));
-
-var expensiveHours = [];
-for (var k = 0; k < expensiveSlots.length; k++) {
-  expensiveHours.push(expensiveSlots[k].localHour);
-}
-
-// Initial discharge threshold from selected expensive slots
-var dischargeThreshold = null;
-if (expensiveSlots.length > 0) {
-  var minExpPrice = expensiveSlots[0].price;
-  for (var et = 1; et < expensiveSlots.length; et++) {
-    if (expensiveSlots[et].price < minExpPrice) minExpPrice = expensiveSlots[et].price;
-  }
-  dischargeThreshold = minExpPrice;
-}
-
-// Remove discharge hours that conflict with charge hours
-var filteredDischargeHours = [];
-for (var fd = 0; fd < expensiveHours.length; fd++) {
-  if (cheapestHours.indexOf(expensiveHours[fd]) === -1) {
-    filteredDischargeHours.push(expensiveHours[fd]);
-  }
-}
-expensiveHours = filteredDischargeHours;
-
-// Recalculate threshold from the filtered set
-dischargeThreshold = null;
-for (var rt = 0; rt < remainingToday.length; rt++) {
-  if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {
-    if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {
-      dischargeThreshold = remainingToday[rt].price;
+  // Threshold = lowest price in selected discharge window
+  for (var rt = 0; rt < remainingToday.length; rt++) {
+    if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {
+      if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {
+        dischargeThreshold = remainingToday[rt].price;
+      }
     }
   }
 }
