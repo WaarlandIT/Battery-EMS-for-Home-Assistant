@@ -1,4 +1,9 @@
 // EMS Decision Engine
+// v3.15 - solar surplus charging suppressed during active discharge window;
+//          discharge takes priority over surplus absorption when inDischargeWindow=true
+// v3.14 - minimum discharge branch now suppressed when solar surplus
+//          exceeds SOLAR_SUPPRESS_DISCHARGE_W; prevents draining battery before
+//          planned discharge window when solar is already exporting
 // v3.13 - fraction clamped to [0.1, 1.0] in scaled charge calc;
 //          prevents negative dc_amps when priceRatio > 1 (price above avg)
 // v3.12 - pre-discharge before upcoming negative price windows;
@@ -22,7 +27,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.13';
+var EMS_VERSION = 'EMS v3.15';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -46,7 +51,8 @@ var CFG = {
   GRID_VOLTAGE:         230,
   SAFETY_MARGIN_A:      2,
   MIN_DISCHARGE_A:      35,
-  MIN_CHARGE_A:         10   // minimum meaningful charge current (A)
+  MIN_CHARGE_A:         10,  // minimum meaningful charge current (A)
+  SOLAR_SUPPRESS_DISCHARGE_W: 500  // suppress min-discharge when solar surplus exceeds this
 };
 
 var currentPrice     = parseFloat(msg.currentPrice) || 0;
@@ -179,7 +185,7 @@ if (isNegPrice && canCharge) {
     reason     = 'Price override: ' + Math.round(priceRatio * 100) + '% of avg (' + currentPrice.toFixed(3) + ' EUR) below threshold - charging at ' + targetAmps + ' A outside planned window';
   }
 
-} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar) {
+} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar && !msg.inDischargeWindow) {
   var surplusAmps = Math.round((actualSurplusW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF);
   charging   = true;
   targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);
@@ -214,10 +220,16 @@ if (isNegPrice && canCharge) {
     discharging = true;
     targetAmps  = clampedAmps;
     reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import + ' + CFG.EXPORT_BIAS_W + ' W export bias' + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
-  } else {
+  } else if (actualSurplusW < CFG.SOLAR_SUPPRESS_DISCHARGE_W) {
+    // Only export from battery when solar is not already covering export.
+    // If solar surplus is large, preserve battery charge for the planned window.
     discharging = true;
     targetAmps  = CFG.MIN_DISCHARGE_A;
     reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price (solar export: ' + actualSurplusW.toFixed(0) + ' W)';
+  } else {
+    discharging = false;
+    targetAmps  = 0;
+    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - solar exporting ' + actualSurplusW.toFixed(0) + ' W, battery idle (surplus > ' + CFG.SOLAR_SUPPRESS_DISCHARGE_W + ' W threshold)';
   }
 
 } else {
