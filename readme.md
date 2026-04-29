@@ -1,5 +1,5 @@
 # Battery EMS – Node-RED Setup & Reference Guide
-**EMS v3.11 / Planner v2.10** — Updated 26 April 2026
+**EMS v3.15 / Planner v2.13** — Updated 29 April 2026
 
 ![Node-red layout](NodeRed.png)
 
@@ -31,7 +31,7 @@ All integrations must be installed and working before the EMS flow can function.
 | **Frank Energie** | [github.com/HiDiHo01/home-assistant-frank_energie](https://github.com/HiDiHo01/home-assistant-frank_energie) | Hourly dynamic electricity prices — primary price source for planner and EMS |
 | **DSMR Smart Meter** | [home-assistant.io/integrations/dsmr](https://www.home-assistant.io/integrations/dsmr/) | Real-time grid import/export (kW) and per-phase load (kW) via P1 port |
 | **Growatt ESPHome** | [github.com/WaarlandIT/ESPHOME-Growatt](https://github.com/WaarlandIT/ESPHOME-Growatt) | Live solar AC output per phase (PAC1/2/3 in W) |
-| **Forecast.Solar** | [home-assistant.io/integrations/forecast_solar](https://www.home-assistant.io/integrations/forecast_solar/) | Solar production forecast — used by planner to reduce grid charge hours when solar will cover part of the charge |
+| **Forecast.Solar** | [home-assistant.io/integrations/forecast_solar](https://www.home-assistant.io/integrations/forecast_solar/) | Solar production forecast — used by planner to reduce grid charge hours and detect pre-discharge opportunities |
 | **ha-solarman** | [github.com/davidrapan/ha-solarman](https://github.com/davidrapan/ha-solarman) | Battery state of charge (%) from BMS via Solarman protocol |
 | **EnergyZero** | [home-assistant.io/integrations/energyzero](https://www.home-assistant.io/integrations/energyzero/) | Used only as an hourly trigger — not the price source |
 
@@ -89,7 +89,7 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
 |---|---|---|
 | Solar forecast remaining | `sensor.energy_production_remaining_today` | `msg.solarForecastRemaining` (kWh) |
 
-> Added in Planner v2.8. The planner deducts this from `kwhNeeded` to reduce the number of grid charge hours when solar will cover part of the charge. Falls back safely to 0 if unavailable.
+> Added in Planner v2.8. The planner deducts this from `kwhNeeded` to reduce grid charge hours when solar will cover part of the charge. Also used for pre-discharge detection. Falls back safely to 0 if unavailable.
 
 ### Battery SoC — [ha-solarman GitHub](https://github.com/davidrapan/ha-solarman)
 | Node | Entity ID | Output |
@@ -153,13 +153,16 @@ In both `server-state-changed` nodes, ensure:
 | Voltage | 48 V DC | `BATTERY_VOLTAGE` |
 | Max charge/discharge | 200 A | `MAX_AMPS` |
 | Max charge power | ~8.16 kW (200 A × 48 V × 0.85) | derived |
+| Max discharge power | 9.6 kW (200 A × 48 V / 1000) | `MAX_DISCHARGE_KW` |
 | Round-trip efficiency | 85% | `ROUND_TRIP_EFF` |
+| Usable discharge capacity | 32 kWh (SOC 95% → 15%) | derived |
 | Full charge time (from SOC_MIN) | ~4.2 h at max rate | derived |
+| Full discharge time (to SOC_DISCHARGE_MIN) | ~3.3 h at max rate | derived |
 | Grid connection | 3-phase, 20 A fuse | `GRID_MAX_A_PHASE` = 18 (2 A margin) |
 
 ---
 
-## Price Planner (v2.8) — How It Works
+## Price Planner (v2.13) — How It Works
 
 The planner runs first each cycle and calculates today's optimal charge and discharge schedule before any sensor data is read.
 
@@ -177,28 +180,51 @@ kwhFromGrid    = max(0, kwhNeeded − solarUsable)
 hoursNeeded    = ceil(kwhFromGrid / 8.16 kW) + 1 safety hour
 ```
 
-When solar is forecast to cover part of the charge, `kwhFromGrid` is smaller, `hoursNeeded` is fewer, and the grid charge window is shorter. The battery is expected to top up naturally during solar production hours. If `solarForecastRemaining` is unavailable it defaults to 0, keeping the planner conservative.
+When solar is forecast to cover part of the charge, `kwhFromGrid` is smaller, `hoursNeeded` is fewer, and the grid charge window is shorter. If `solarForecastRemaining` is unavailable it defaults to 0, keeping the planner conservative.
 
-### Charge window — centered on cheapest hour (v2.6)
+### Charge window — centered on cheapest hour, with validity gate (v2.6 / v2.12)
 
-Rather than picking the cheapest N scattered hours, the planner:
-1. Finds the single cheapest hour remaining today
-2. Places it at the center of the window
-3. Expands left and right, always picking the cheaper neighbour next, until `hoursNeeded` hours are filled
+The planner finds the single cheapest remaining hour and expands outward until `hoursNeeded` hours are filled — always picking the cheaper neighbour at each step. An **early-hour bias** (v2.9) prefers earlier hours when neighbour prices are within `EARLY_BIAS_EUR` (0.02 EUR) of each other, keeping grid charging before the solar peak.
 
-This produces a **contiguous time window** with the cheapest price in the middle. Example with `hoursNeeded = 5` and cheapest hour at 14h:
+Since v2.12, the charge window is only built if `cheapestPrice <= chargePriceCap`. If all remaining hours are above the cap (e.g. late evening), `plannedHours` is empty and the EMS falls back to ratio-based logic only — preventing the planner from scheduling charging at expensive hours.
 
 ```
-Step 1: [14h]
-Step 2: left=13h (0.18) vs right=15h (0.16) → pick 15h  → [14h, 15h]
-Step 3: left=13h (0.18) vs right=16h (0.20) → pick 13h  → [13h, 14h, 15h]
-Step 4: left=12h (0.21) vs right=16h (0.20) → pick 16h  → [13h, 14h, 15h, 16h]
-Step 5: left=12h (0.21) vs right=17h (0.28) → pick 12h  → [12h, 13h, 14h, 15h, 16h]
+chargeWindowValid = cheapestPrice <= chargePriceCap
+if (!chargeWindowValid) plannedHours = []
 ```
 
-### Discharge hour selection (v2.7)
+Example with `hoursNeeded = 5`, cheapest hour at 14h, `EARLY_BIAS_EUR = 0.02`:
+```
+Start:          [14h]
+right=15h(0.16) cheaper than left=13h(0.18) by 0.02 → within bias → pick left  → [13h, 14h]
+right=15h(0.16) cheaper than left=12h(0.21) by 0.05 → exceeds bias → pick right → [13h, 14h, 15h]
+left=12h(0.21) vs right=16h(0.20) → within bias → pick left                     → [12h, 13h, 14h, 15h]
+left=11h vs right=16h(0.20) → pick right if cheaper                              → [12h, 13h, 14h, 15h, 16h]
+```
 
-Hours are selected from morning band (06h–11h) and evening band (16h–23h). Since v2.7 the minimum filter is `avgPrice` — any hour below the daily average is excluded from discharge regardless of band. Top 50% by price from each qualifying band is selected. Any discharge hour overlapping a charge hour is removed and the threshold recalculated from the filtered set.
+### Discharge window — centered on most expensive hour (v2.13)
+
+The discharge window is now sized from actual usable capacity and built symmetrically around the most expensive hour, with a late-hour bias to anchor the window in the evening peak band.
+
+```
+kwhToDischarge       = BATTERY_KWH × ((SOC_DISCHARGE_MAX − SOC_DISCHARGE_MIN_PL) / 100)
+                     = 40 × ((95 − 15) / 100) = 32 kWh
+dischargeHoursNeeded = ceil(32 / 9.6 kW) + 1 = 5h
+```
+
+The most expensive remaining hour above `avgPrice` becomes the center. The window expands outward preferring the more expensive neighbour. `LATE_BIAS_EUR` (0.02 EUR) means the later hour is preferred when prices are within that margin — keeping the window in the evening peak rather than drifting into the morning.
+
+Any discharge hour overlapping a charge hour is removed and the threshold recalculated from the filtered set.
+
+### Pre-discharge before negative price windows (v2.11)
+
+When negative price hours are forecast later today, the planner detects them and flags hours before the negative window as pre-discharge candidates — provided those hours have prices above `dischargeAbsMin` and are not already negative. The EMS then discharges during those hours to free capacity for the upcoming negative price charging.
+
+```
+hoursUntilNegWindow  = hours from now until first future negative price hour
+preDischargeHours    = hours before the neg window with price >= avgPrice × DISCHARGE_ABS_RATIO
+inPreDischargeWindow = current hour is in preDischargeHours AND SoC > SOC_DISCHARGE_MIN
+```
 
 ### Planner config constants
 
@@ -209,10 +235,15 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 | `SOC_MAX` | 95% | Maximum SoC (ceiling) |
 | `SOC_NORMAL_THRESHOLD` | 80% | Above this SoC uses tight charge cap |
 | `CHARGE_ABS_RATIO` | 0.55 | Tight charge cap = `avgPrice × 0.55` |
-| `DISCHARGE_ABS_RATIO` | 0.55 | Kept for `dischargeAbsMin` reference; discharge band now uses `avgPrice` directly |
-| `SOLAR_FORECAST_EFF` | 0.90 | 10% margin on solar forecast (forecast tends to be optimistic) |
+| `DISCHARGE_ABS_RATIO` | 0.55 | Discharge abs min = `avgPrice × 0.55` |
+| `SOLAR_FORECAST_EFF` | 0.90 | 10% margin on solar forecast |
 | `SAFETY_BUFFER_H` | 1 | Extra hour added to `hoursNeeded` as safety margin |
 | `ROUND_TRIP_EFF` | 0.85 | Used to calculate max charge kW rate |
+| `EARLY_BIAS_EUR` | 0.02 | Prefer earlier hour in charge window when price diff is within this margin |
+| `LATE_BIAS_EUR` | 0.02 | Prefer later hour in discharge window when price diff is within this margin |
+| `MAX_DISCHARGE_KW` | 9.6 | Max discharge rate (200 A × 48 V / 1000) for window sizing |
+| `SOC_DISCHARGE_MAX` | 95% | SoC from which discharge is measured |
+| `SOC_DISCHARGE_MIN_PL` | 15% | SoC floor used in discharge window sizing |
 
 ### Planner outputs written to msg
 
@@ -220,9 +251,14 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 |---|---|---|
 | `msg.inChargingWindow` | bool / null | true = current hour is in the planned charge window; null = no price data |
 | `msg.inDischargeWindow` | bool | true = current hour is in the planned discharge window |
+| `msg.inPreDischargeWindow` | bool | true = current hour is a pre-discharge hour before a negative price window |
+| `msg.preDischargeHours` | int[] | Hours flagged for pre-discharge |
+| `msg.hoursUntilNegWindow` | int / null | Hours until first future negative price hour |
+| `msg.futureNegHoursCount` | int | Number of future negative price hours today |
+| `msg.negPriceHoursRemaining` | int | Remaining negative price hours including current (for spread charging) |
 | `msg.dischargeThreshold` | float | Lowest price in selected discharge hours (EUR/kWh) |
-| `msg.plannedChargeHours` | int[] | Sorted charge hours e.g. [12, 13, 14, 15, 16] |
-| `msg.plannedDischargeHours` | int[] | Sorted discharge hours e.g. [20, 21, 22] |
+| `msg.plannedChargeHours` | int[] | Sorted charge hours e.g. [12, 13, 14] |
+| `msg.plannedDischargeHours` | int[] | Sorted discharge hours e.g. [19, 20, 21, 22, 23] |
 | `msg.hoursNeeded` | int | Grid charge hours needed (after solar deduction) |
 | `msg.kwhNeeded` | float | Total kWh needed to reach 95% SoC |
 | `msg.kwhFromGrid` | float | kWh to be sourced from grid (kwhNeeded − solarUsable) |
@@ -230,12 +266,12 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 | `msg.cheapestPrice` | float | Cheapest remaining hour today |
 | `msg.currentPrice` | string | Current price from Frank Energie |
 | `msg.avgPrice` | string | Today's average price from Frank Energie |
-| `msg.plannerVersion` | string | e.g. `'v2.8'` |
-| `msg.plannerReason` | string | Human-readable summary including solar deduction |
+| `msg.plannerVersion` | string | e.g. `'v2.13'` |
+| `msg.plannerReason` | string | Human-readable summary including solar deduction and pre-discharge status |
 
 ---
 
-## EMS Decision Engine (v3.7) — Configuration Reference
+## EMS Decision Engine (v3.15) — Configuration Reference
 
 ### CFG parameters
 
@@ -247,7 +283,7 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 | `SOC_MIN` | 10% | Discharge floor — never goes below this |
 | `SOC_MAX` | 95% | Hard charge ceiling — never charges above this regardless of price |
 | `SOC_DISCHARGE_MIN` | 15% | Discharge guard — will not discharge below this even in peak window |
-| `SOC_CRITICAL` | 20% | At or below this SoC, charge at full amps in any below-average hour |
+| `SOC_CRITICAL` | 20% | At or below this SoC, charge at full amps if price is genuinely cheap |
 | `CHARGE_THRESHOLD` | 0.80 | Ratio threshold for price override and fallback charging |
 | `DISCHARGE_THRESHOLD` | 1.20 | Fallback: discharge if price ≥ 120% of avg (no planner data) |
 | `CHARGE_ABS_RATIO` | 0.55 | `chargeAbsMax` = `avgPrice × 0.55` |
@@ -257,6 +293,7 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 | `HYSTERESIS` | 0.05 | Price ratio band to prevent rapid toggling at thresholds |
 | `SOLAR_SURPLUS_W` | 500 | Min solar export surplus (W) to start solar charging |
 | `SOLAR_SURPLUS_EXIT_W` | 200 | Min solar export surplus (W) to keep solar charging going |
+| `SOLAR_SUPPRESS_DISCHARGE_W` | 500 | Suppress minimum discharge when solar surplus exceeds this |
 | `ROUND_TRIP_EFF` | 0.85 | Charging efficiency — applied to charge amps only, NOT discharge |
 | `GRID_MAX_A_PHASE` | 18 | Usable amps per phase (20 A fuse − 2 A margin) |
 | `GRID_VOLTAGE` | 230 | AC grid voltage |
@@ -267,156 +304,147 @@ Hours are selected from morning band (06h–11h) and evening band (16h–23h). S
 ### Decision priority (highest to lowest)
 
 ```
-1. Negative price AND canCharge          → charge at spread rate across remaining
-                                           negative price hours; solar surplus offsets
-                                           grid draw to keep netGrid close to 0
+1. Negative price AND canCharge          → spread charge across remaining negative hours;
+                                           solar surplus offsets grid draw to keep netGrid ~0
 
 2. isPriceLow AND canCharge              → charge at scaled amps
    isPriceLow is true when ANY of:
-     a) SoC <= SOC_CRITICAL (20%) AND price < avgPrice   → full amps, critical recovery
-     b) inChargingWindow = true (planner window)         → scaled amps
-     c) isPriceVeryLow: ratio <= 0.80 AND                → scaled amps, outside window
-        price <= avgPrice × 0.55
+     a) SoC <= SOC_CRITICAL AND          → full amps, critical recovery
+        price < avgPrice AND             (requires price <= chargeAbsMax since v3.8)
+        price <= chargeAbsMax
+     b) inChargingWindow = true          → scaled amps (planner window)
+     c) isPriceVeryLow: ratio <= 0.80    → scaled amps outside planned window
+        AND price <= avgPrice × 0.55
 
 3. Solar surplus > threshold AND         → absorb surplus at surplus amps
-   canChargeSolar                          (always before discharge — free energy first)
+   canChargeSolar AND                      (skipped during active discharge window
+   NOT inDischargeWindow                   since v3.15 — discharge takes priority)
 
-4. isPriceHigh AND canDischarge          → discharge to cover import + export bias
-   isPriceHigh requires price >= avgPrice (v3.6 guard)
+4. inPreDischargeWindow AND canDischarge → pre-discharge to free capacity before
+                                           upcoming negative price window
 
-5. None of the above                     → idle
+5. isPriceHigh AND canDischarge          → discharge to cover import + export bias
+     a) dischargeTarget > 0             → cover gross import + bias at full calc amps
+     b) dischargeTarget = 0 AND         → export at MIN_DISCHARGE_A
+        surplus < SOLAR_SUPPRESS_W        (suppressed if solar already exporting heavily)
+
+6. None of the above                     → idle
 ```
 
 ### Charge reason strings
 
-The reason string now distinguishes how the charge decision was made:
-
 | Trigger | Reason string |
 |---|---|
 | `batterySoC <= SOC_CRITICAL` | `Critical SoC (19%) - charging at max 155 A (price 0.078 EUR below avg 0.192 EUR)` |
-| `inChargingWindow = true` | `Planner: cheapest window (0.127 EUR) - charging at 94 A. Hours: 12h,13h,14h,15h,16h` |
+| `inChargingWindow = true` | `Planner: cheapest window (0.127 EUR) - charging at 94 A. Hours: 12h,13h,14h` |
 | `isPriceVeryLow` override | `Price override: 41% of avg (0.078 EUR) below threshold - charging at 155 A outside planned window` |
-| Negative price (spread, with solar) | `Negative price (-0.084 EUR/kWh) - charging at 123 A (6 neg-price hour(s) remaining, spreading 30.0 kWh over window, solar covers ~42 A, grid ~81 A)` |
-| Negative price (spread, no solar) | `Negative price (-0.185 EUR/kWh) - charging at 10 A (4 neg-price hour(s) remaining, spreading 1.2 kWh over window)` |
+| Negative price with solar offset | `Negative price (-0.084 EUR/kWh) - charging at 123 A (6 neg-price hour(s) remaining, spreading 30.0 kWh over window, solar covers ~42 A, grid ~81 A)` |
+| Negative price no solar | `Negative price (-0.185 EUR/kWh) - charging at 10 A (4 neg-price hour(s) remaining, spreading 1.2 kWh over window)` |
+| Pre-discharge | `Pre-discharge: neg price in 3h (4 neg hour(s)) - discharging 194 A to free 28.0 kWh over 3h (SoC 85% → 15%)` |
+| Solar suppressed during discharge window | `High price (128% of avg, 0.261 EUR) - solar exporting 6329 W, battery idle (surplus > 500 W threshold)` |
 
-### isPriceLow logic (v3.7)
+### isPriceLow logic (v3.7 / v3.8)
 
 ```javascript
 var isPriceVeryLow = priceRatio <= CFG.CHARGE_THRESHOLD        // price <= 80% of avg
                   && currentPrice <= chargeAbsMax;             // price <= avgPrice × 0.55
 
-if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice) {
-  isPriceLow = true;                                           // critical SoC — any below-avg hour
+if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <= chargeAbsMax) {
+  isPriceLow = true;                     // critical SoC — cheap hour required (v3.8 guard)
 } else if (inChargingWindow === null) {
-  isPriceLow = isPriceVeryLow || isNegPrice;                  // no planner — ratio fallback
+  isPriceLow = isPriceVeryLow || isNegPrice;        // no planner — ratio fallback
 } else {
-  isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice; // planner + ratio override
+  isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice; // planner + override
 }
 ```
 
-The ratio override (`isPriceVeryLow`) ensures that dramatically cheap hours are never wasted even if they fall outside the planned window — for example, a cheap morning dip before the planned 12h–16h window.
+The `chargeAbsMax` guard on `SOC_CRITICAL` (added v3.8) prevents emergency charging at genuinely expensive hours when early-morning `avgPrice` is skewed by a partial day's data.
 
 ### Negative price charging — spread rate with solar offset (v3.10 / v3.11)
 
-When price is negative the EMS no longer charges at max rate. Instead it spreads the charge across all remaining negative price hours, and offsets grid draw with any available solar surplus.
-
 ```
-// Step 1 — spread rate across negative price window
-usableCapacity  = BATTERY_KWH × ((SOC_MAX − SOC_MIN) / 100)
-currentKwh      = BATTERY_KWH × ((SoC% − SOC_MIN) / 100)
-kwhHeadroom     = usableCapacity − currentKwh
-targetKwPerHour = kwhHeadroom / negPriceHoursRemaining
-spreadAmps      = (targetKwPerHour × 1000) / BATTERY_VOLTAGE / ROUND_TRIP_EFF
+// Step 1 — spread rate across remaining negative price window
+kwhHeadroom     = BATTERY_KWH × ((SOC_MAX − SOC_MIN) / 100) − currentKwh
+spreadAmps      = (kwhHeadroom / negPriceHoursRemaining × 1000) / BATTERY_VOLTAGE / ROUND_TRIP_EFF
 
-// Step 2 — solar offset to reduce grid draw
-homeLoadW        = solarTotalW + netGridW        // total home consumption
-solarForBatteryW = max(0, solarTotalW − homeLoadW)  // solar beyond home load
+// Step 2 — offset grid draw with solar available for battery
+homeLoadW        = solarTotalW + netGridW
+solarForBatteryW = max(0, solarTotalW − homeLoadW)
 solarOffsetAmps  = solarForBatteryW / BATTERY_VOLTAGE
+gridAmps         = max(0, spreadAmps − solarOffsetAmps)
 
-// Step 3 — final amps
-gridAmps  = max(0, spreadAmps − solarOffsetAmps)   // grid contribution
+// Step 3 — clamp
 targetAmps = clamp(spreadAmps, MIN_CHARGE_A, maxAllowedChargeA)
 ```
 
-Example — SoC 20%, 6 negative price hours remaining, solar 6000 W, exporting 2000 W:
-```
-kwhHeadroom     = 34 − 4 = 30 kWh
-spreadAmps      = (30/6 × 1000) / 48 / 0.85 = 123 A
-homeLoadW       = 6000 + (−2000) = 4000 W
-solarForBattery = 6000 − 4000 = 2000 W → 42 A offset
-gridAmps        = 123 − 42 = 81 A      (solar covers the rest)
+The spread rate automatically increases as the window shortens — the battery always fills before the negative window closes. `MIN_CHARGE_A: 10` prevents trivially small current commands at near-full SoC.
+
+### Pre-discharge (v3.12)
+
+```javascript
+kwhToDischarge = BATTERY_KWH × ((SOC_DISCHARGE_MIN − SOC_MIN) / 100)  // capacity to free
+targetKw       = kwhToDischarge / preDischargeHoursCount
+preAmps        = clamp(targetKw × 1000 / BATTERY_VOLTAGE, MIN_DISCHARGE_A, MAX_AMPS)
 ```
 
-As the negative window shortens, the spread rate automatically increases so the battery always fills before the window closes. At 2–3 hours remaining it will ramp toward `maxAllowedChargeA`. The `MIN_CHARGE_A: 10` floor prevents commanding a trivially small current when the battery is nearly full.
-
-`negPriceHoursRemaining` is calculated by the planner from the Frank Energie price array and passed to the EMS each cycle.
+Discharge rate is spread across all available pre-discharge hours to reach `SOC_DISCHARGE_MIN` just before the negative window starts.
 
 ### isPriceHigh guard (v3.6)
 
 ```javascript
 if (msg.inDischargeWindow === true) {
-  // Planner window alone is not enough — price must still be above average
   isPriceHigh = currentPrice >= avgPrice && currentPrice >= dischargeAbsMin;
 } else {
   isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;
 }
 ```
 
-This prevents the planner from triggering discharge in hours that fall below the daily average — a real scenario when prices are unusually flat or the morning band includes cheap hours.
+`inDischargeWindow` alone is not sufficient — the price must still be above the daily average. Prevents discharge at below-average hours even when the planner flags them.
 
-### canCharge guard (v3.9)
+### Solar surplus suppression during discharge window (v3.15)
 
 ```javascript
-// v3.9 — hard ceiling, no exceptions:
-canCharge = batterySoC < CFG.SOC_MAX
-// Negative price no longer overrides the ceiling.
-// At SoC >= 95% the system is always idle or discharging.
+} else if (actualSurplusW > solarSurplusThreshold && canChargeSolar && !msg.inDischargeWindow) {
 ```
 
-### canDischarge guard (v3.5 fix)
+When `inDischargeWindow = true`, the solar surplus charging branch is skipped entirely. Solar exports freely to grid; the battery discharges to cover any remaining home load. This prevents the battery from charging from solar surplus just before the planned discharge window.
+
+### Minimum discharge suppression (v3.14)
 
 ```javascript
-canDischarge = batterySoC > SOC_MIN && batterySoC >= SOC_DISCHARGE_MIN
-// Effectively: SoC >= 15% (SOC_DISCHARGE_MIN is the binding constraint)
+} else if (actualSurplusW < CFG.SOLAR_SUPPRESS_DISCHARGE_W) {
+  // export at MIN_DISCHARGE_A
+} else {
+  // idle — solar already exporting heavily, preserve battery for discharge window
+}
+```
+
+When `dischargeTarget = 0` (house load covered by solar) and solar surplus exceeds `SOLAR_SUPPRESS_DISCHARGE_W` (500 W), the minimum export discharge is suppressed. Battery preserves charge for the planned discharge window.
+
+### canCharge / canDischarge guards
+
+```javascript
+canCharge    = batterySoC < CFG.SOC_MAX          // hard ceiling, no exceptions (v3.9)
+canDischarge = batterySoC > CFG.SOC_MIN && batterySoC >= CFG.SOC_DISCHARGE_MIN  // v3.5
 ```
 
 ### Discharge amp calculation (v3.5)
 
 ```
-grossTargetW     = gridImport_W + EXPORT_BIAS_W
-dischargeTargetW = grossTargetW × DISCHARGE_OVERSHOOT    ← applied once only
+dischargeTargetW = (gridImport_W + EXPORT_BIAS_W) × DISCHARGE_OVERSHOOT
 dc_amps          = clamp(dischargeTargetW / BATTERY_VOLTAGE, MIN_DISCHARGE_A, MAX_AMPS)
 ```
 
-`ROUND_TRIP_EFF` is NOT applied to discharge — efficiency only applies when charging. Applying it to discharge inflated amps by ~18% before v3.5.
-
-Example (import 3698 W):
-```
-(3698 + 800) × 1.25 ÷ 48 = 117 A
-```
+`ROUND_TRIP_EFF` is NOT applied — efficiency only applies when charging.
 
 ### Charge amp calculation
 
 ```
 worstPhaseHeadroomA = GRID_MAX_A_PHASE − maxPhaseLoad_A − SAFETY_MARGIN_A
-gridHeadroomW       = worstPhaseHeadroomA × GRID_VOLTAGE × 3
-maxAllowedChargeA   = min(MAX_AMPS, round(gridHeadroomW / BATTERY_VOLTAGE × ROUND_TRIP_EFF))
-```
+maxAllowedChargeA   = min(MAX_AMPS, round((worstPhaseHeadroomA × GRID_VOLTAGE × 3) / BATTERY_VOLTAGE × ROUND_TRIP_EFF))
 
-For scaled charging (planner window or ratio override, SoC > SOC_CRITICAL):
-```
-priceDiscount = 1 − priceRatio
-fraction      = 0.50 + (priceDiscount × 2.5)    // 50%–100% of maxAllowedChargeA
-targetAmps    = round(maxAllowedChargeA × fraction)
-```
-
-Example (phase headroom 12.71 A, price 41% of avg):
-```
-gridHeadroom    = 12.71 × 230 × 3 = 8,770 W
-maxAllowedCharge = (8770 / 48) × 0.85 = 155 A
-priceDiscount   = 1 − 0.41 = 0.59
-fraction        = 0.50 + (0.59 × 2.5) = 1.0 → capped at 1.0
-targetAmps      = 155 A
+fraction   = clamp(0.50 + (1 − priceRatio) × 2.5, 0.10, 1.0)   // v3.13 clamp prevents negative
+targetAmps = round(maxAllowedChargeA × fraction)
 ```
 
 ### State confirmation / debounce
@@ -434,47 +462,51 @@ Reason string shows `[confirming N/2]` or `[pending change to X 1/2]` while debo
 
 ```javascript
 msg.payload = {
-  version:     "EMS v3.11 / Planner v2.10",
-  dc_amps:     155,
-  charging:    true,
-  discharging: false,
-  reason:      "Negative price (-0.084 EUR/kWh) - charging at 123 A (6 neg-price hour(s) remaining, spreading 30.0 kWh over window, solar covers ~42 A, grid ~81 A)",
+  version:     "EMS v3.15 / Planner v2.13",
+  dc_amps:     130,
+  charging:    false,
+  discharging: true,
+  reason:      "High price (128% of avg, 0.261 EUR) - discharging 130 A to cover 4178 W gross import + 800 W export bias",
 
   planner: {
-    inWindow:              false,
-    inDischargeWindow:     false,
-    dischargeThreshold:    0.304,
-    hoursNeeded:           5,          // grid hours needed (after solar deduction)
-    kwhNeeded:             29.2,       // total kWh to reach 95% SoC
-    kwhFromGrid:           22.0,       // kWh to charge from grid (kwhNeeded − solar)
-    solarForecastKwh:      7.2,        // usable solar kWh deducted (forecast × 0.90)
-    cheapestPrice:         -0.101,
-    negPriceHoursRemaining: 6,
-    plannedHours:          [12, 13, 14, 15, 16],
-    plannedDischargeHours: [20, 21, 22],
-    reason:                "Need 29.2 kWh total, solar covers ~7.2 kWh, 22.0 kWh from grid (5h). SoC 22% - cheapest hour: 14h (-0.101 EUR)..."
+    inWindow:               false,
+    inDischargeWindow:      true,
+    inPreDischargeWindow:   false,
+    preDischargeHours:      [],
+    hoursUntilNegWindow:    null,
+    futureNegHoursCount:    0,
+    negPriceHoursRemaining: 0,
+    dischargeThreshold:     0.244,
+    hoursNeeded:            3,
+    kwhNeeded:              29.6,
+    kwhFromGrid:            8.2,
+    solarForecastKwh:       21.4,
+    cheapestPrice:          0.060,
+    plannedHours:           [12, 13, 14],
+    plannedDischargeHours:  [19, 20, 21, 22, 23],
+    reason:                 "Need 29.6 kWh total, solar covers ~21.4 kWh, 8.2 kWh from grid (3h). SoC 21% - cheapest hour: 13h (0.060 EUR)..."
   },
 
   inputs: {
-    currentPrice:        0.078,
-    avgPrice:            0.192,
-    priceRatio:          40.6,         // % of avg
-    chargeAbsMax:        0.106,        // avgPrice × CHARGE_ABS_RATIO
-    dischargeAbsMin:     0.106,        // avgPrice × DISCHARGE_ABS_RATIO
-    lastState:           "charging",
+    currentPrice:        0.261,
+    avgPrice:            0.205,
+    priceRatio:          127.6,
+    chargeAbsMax:        0.113,
+    dischargeAbsMin:     0.113,
+    lastState:           "discharging",
     batterySoC:          22,
-    solarTotal_W:        1374,
-    netGrid_W:           685,          // positive = importing
-    dischargeTarget_W:   777,          // gross import W (pre-bias reference)
+    solarTotal_W:        1530,
+    netGrid_W:           4178,
+    dischargeTarget_W:   4178,
     actualSurplus_W:     0,
-    phaseL1_A:           3.29,
-    phaseL2_A:           0,
-    phaseL3_A:           0.09,
-    maxPhaseLoad_A:      3.29,
-    worstHeadroom_A:     12.71,
-    gridHeadroom_W:      8772,
-    maxAllowedCharge_A:  155,
-    timestamp:           "2026-04-25T09:02:22.277Z"
+    phaseL1_A:           4.05,
+    phaseL2_A:           3.84,
+    phaseL3_A:           10.28,
+    maxPhaseLoad_A:      10.28,
+    worstHeadroom_A:     5.72,
+    gridHeadroom_W:      3948,
+    maxAllowedCharge_A:  70,
+    timestamp:           "2026-04-26T17:47:53.852Z"
   }
 }
 ```
@@ -492,17 +524,24 @@ msg.payload = {
 | Discharge amps ~18% too high | Old pre-v3.5 script | Check version string in debug output |
 | Discharging below avg price | Old pre-v3.6 script | `isPriceHigh` avgPrice guard missing — update to v3.6+ |
 | Not charging at cheap hours outside planner window | Old pre-v3.7 script | `isPriceVeryLow` override missing — update to v3.7 |
+| Charging at expensive hours at low SoC | Old pre-v3.8 script | `SOC_CRITICAL` branch lacks `chargeAbsMax` guard — update to v3.8+ |
+| Battery charges above 95% at negative price | Old pre-v3.9 script | `canCharge` had `isNegPrice` override — update to v3.9+ |
 | Discharge not stopping at low SoC | Old `canDischarge` bug | Ensure EMS v3.5+ is deployed |
-| Solar forecast not deducting from kwhNeeded | `solarForecastRemaining` = 0 | Check `get-solar-forecast` node is in chain; verify `sensor.energy_production_remaining_today` entity exists |
-| Reason says "Planner: cheapest window" outside planned hours | Old pre-v3.7 reason string | Update to EMS v3.7 |
+| Solar forecast not deducting from kwhNeeded | `solarForecastRemaining` = 0 | Check `get-solar-forecast` node is in chain; verify `sensor.energy_production_remaining_today` |
 | `[confirming 1/2]` in reason | State pending confirmation | Normal — resolves next cycle |
-| `maxAllowedCharge_A: 0` | Home load near grid limit | Large appliance consuming full phase headroom — EMS resumes when load drops |
-| Charge amps fluctuate with appliances | Expected — phase headroom recalculated every cycle | Normal behaviour; EMS always stays within grid limit |
+| `maxAllowedCharge_A: 0` | Home load near grid limit | Large appliance consuming headroom — EMS resumes when load drops |
+| Charge amps fluctuate with appliances | Expected behaviour | Phase headroom recalculated every cycle — always within grid limit |
 | Charging at max during negative price | Old pre-v3.10 script | Update to EMS v3.10+ for spread charging |
-| Battery fills too fast during long negative window | `negPriceHoursRemaining` not received | Check Planner v2.10+ is deployed; verify planner node passes `msg.negPriceHoursRemaining` |
-| Charging from grid when solar is exporting | Old pre-v3.11 script | Solar offset missing — update to EMS v3.11 |
+| Battery fills too fast during long negative window | `negPriceHoursRemaining` not received | Check Planner v2.10+ deployed; verify `msg.negPriceHoursRemaining` passed |
+| Charging from grid when solar is exporting | Old pre-v3.11 script | Solar offset missing — update to EMS v3.11+ |
+| `dc_amps: 10` at near-full battery during neg price | Expected — MIN_CHARGE_A floor | Normal; battery nearly full, current intentionally low |
+| Charging planned at expensive evening hours | Old pre-v2.12 planner | Charge window validity gate missing — update to Planner v2.12+ |
+| Negative amps / wrong Deye value | Old pre-v3.13 EMS | `fraction` not clamped — update to EMS v3.13+; also clamp value before writing to Deye entity |
+| Battery discharging before evening window (solar hour) | Old pre-v3.14 script | Min-discharge suppression missing — update to EMS v3.14+ |
+| Solar surplus charging during discharge window | Old pre-v3.15 script | Solar branch not gated on `inDischargeWindow` — update to EMS v3.15+ |
+| Pre-discharge not firing before negative window | `inPreDischargeWindow` false | Check Planner v2.11+ deployed; verify hours before neg window are above dischargeAbsMin |
+| Discharge window wrong size or wrong hours | Old pre-v2.13 planner | Discharge window used band percentage — update to Planner v2.13+ for centered expansion |
 | Window biased too far right into solar hours | Old pre-v2.9 planner | Early-hour bias missing — update to Planner v2.9+ |
-| `dc_amps: 10` at nearly-full battery during neg price | Expected — MIN_CHARGE_A floor | Normal; battery only needs 1–2 kWh, current is intentionally low |
 
 ---
 
@@ -510,25 +549,32 @@ msg.payload = {
 
 | Version | Date | Change |
 |---|---|---|
-| **EMS v3.11** | 2026-04-26 | Solar surplus offsets grid draw during negative price charging — `homeLoadW` derived from solar + netGrid; `solarOffsetAmps` reduces grid contribution to keep netGrid ~0 |
+| **EMS v3.15** | 2026-04-28 | Solar surplus charging branch suppressed during active `inDischargeWindow`; discharge now takes priority over surplus absorption in the evening peak |
+| **EMS v3.14** | 2026-04-28 | Minimum discharge (no home load) suppressed when solar surplus exceeds `SOLAR_SUPPRESS_DISCHARGE_W` (500 W); preserves battery charge before planned discharge window |
+| **EMS v3.13** | 2026-04-26 | `fraction` in scaled charge clamped to [0.10, 1.0] — prevents negative dc_amps when price is above avg; charge window validity gate (`chargeWindowValid`) prevents charging in expensive hours |
+| **EMS v3.12** | 2026-04-26 | Pre-discharge branch added — discharges to `SOC_DISCHARGE_MIN` when negative prices are forecast ahead, spread across available hours before the window |
+| **EMS v3.11** | 2026-04-26 | Solar surplus offsets grid draw during negative price charging — `homeLoadW = solarTotalW + netGridW`; `solarOffsetAmps` reduces grid contribution to keep netGrid ~0 |
 | **EMS v3.10** | 2026-04-26 | Negative price charging spread across full negative window: `spreadAmps = kwhHeadroom / negPriceHoursRemaining / 48V / eff`; ramps up automatically as window closes |
-| **EMS v3.9** | 2026-04-26 | `canCharge` hard ceiling — removed `isNegPrice` override; battery never charges above `SOC_MAX` (95%) regardless of price |
-| **EMS v3.8** | 2026-04-26 | `SOC_CRITICAL` branch now also requires `currentPrice <= chargeAbsMax`; prevents charging at expensive hours when early-morning `avgPrice` is skewed |
-| **EMS v3.7** | 2026-04-25 | Added `isPriceVeryLow` ratio override — dramatically cheap hours now charge even outside the planned window; distinct reason strings for planner window vs ratio override vs critical SoC |
-| **EMS v3.6** | 2026-04-25 | `SOC_CRITICAL` check changed `<` → `<=` (boundary SoC 20% was missed); `isPriceHigh` now requires `currentPrice >= avgPrice` — planner `inDischargeWindow` can no longer trigger discharge below avg price |
-| EMS v3.5 | 2026-04-20 | Fixed `canDischarge` (`\|\|` → `&&`); removed `ROUND_TRIP_EFF` from discharge amp calc (was inflating amps ~18%) |
-| EMS v3.4 | 2026-04-19 | All fixed price thresholds replaced with ratios of daily avg (`CHARGE_ABS_RATIO`, `DISCHARGE_ABS_RATIO`) |
-| EMS v3.3 | 2026-04-15 | Solar surplus uses `canChargeSolar`; moved before discharge branch in priority order |
-| EMS v3.2 | 2026-04-12 | `SOC_DISCHARGE_MIN` 15%; gross grid import as discharge base target |
+| **EMS v3.9** | 2026-04-26 | `canCharge` hard ceiling — removed `isNegPrice` override; battery never charges above 95% regardless of price |
+| **EMS v3.8** | 2026-04-26 | `SOC_CRITICAL` branch requires `currentPrice <= chargeAbsMax`; prevents charging at expensive hours when early-morning `avgPrice` is skewed |
+| **EMS v3.7** | 2026-04-25 | `isPriceVeryLow` ratio override added; distinct reason strings for planner window vs ratio override vs critical SoC |
+| **EMS v3.6** | 2026-04-25 | `SOC_CRITICAL` check `<` → `<=`; `isPriceHigh` requires `currentPrice >= avgPrice` |
+| EMS v3.5 | 2026-04-20 | `canDischarge` bug fixed; `ROUND_TRIP_EFF` removed from discharge calc |
+| EMS v3.4 | 2026-04-19 | Fixed price thresholds replaced with `avgPrice` ratios |
+| EMS v3.3 | 2026-04-15 | Solar surplus uses `canChargeSolar`; moved before discharge branch |
+| EMS v3.2 | 2026-04-12 | `SOC_DISCHARGE_MIN` 15%; gross import as discharge base |
 | EMS v3.1 | 2026-04-10 | `SOC_DISCHARGE_MIN` 15%; `SOC_CRITICAL` 20% |
 | EMS v3.0 | 2026-04-08 | P1 phase readings used directly for per-phase headroom |
-| **Planner v2.10** | 2026-04-26 | Counts remaining negative price hours (`negPriceHoursRemaining`) from Frank Energie array and passes to EMS for spread charge calculation |
-| **Planner v2.9** | 2026-04-26 | Early-hour bias (`EARLY_BIAS_EUR = 0.02`) in window expansion — prefers earlier hours when neighbour price difference is within margin, keeping grid charge before solar peak |
-| **Planner v2.8** | 2026-04-25 | Solar forecast (`sensor.energy_production_remaining_today`) deducted from `kwhNeeded`; `kwhFromGrid` and `solarForecastKwh` added to planner outputs; `get-solar-forecast` node required in chain |
-| **Planner v2.7** | 2026-04-25 | Discharge band filter raised from `dischargeAbsMin` (avg × 0.55) to `avgPrice` — hours below daily average can never be discharge hours |
-| **Planner v2.6** | 2026-04-25 | Charge window now centered on cheapest hour and expanded outward to adjacent hours — window is always contiguous in time |
+| **Planner v2.13** | 2026-04-28 | Discharge window centered on most expensive hour and expanded outward; sized from actual usable capacity (32 kWh ÷ 9.6 kW = 5h); `LATE_BIAS_EUR` keeps window in evening peak |
+| **Planner v2.12** | 2026-04-26 | Charge window validity gate — window only built if `cheapestPrice <= chargePriceCap`; prevents scheduling charges at expensive evening hours |
+| **Planner v2.11** | 2026-04-26 | Pre-discharge detection — scans for future negative price hours; flags pre-discharge window hours and passes `inPreDischargeWindow`, `hoursUntilNegWindow`, `futureNegHoursCount` to EMS |
+| **Planner v2.10** | 2026-04-26 | Counts remaining negative price hours (`negPriceHoursRemaining`) for EMS spread charge calculation |
+| **Planner v2.9** | 2026-04-26 | Early-hour bias (`EARLY_BIAS_EUR = 0.02`) in charge window expansion — prefers earlier hours when price diff is within margin |
+| **Planner v2.8** | 2026-04-25 | Solar forecast deducted from `kwhNeeded`; `kwhFromGrid` and `solarForecastKwh` added to outputs |
+| **Planner v2.7** | 2026-04-25 | Discharge band filter raised from `dischargeAbsMin` to `avgPrice` |
+| **Planner v2.6** | 2026-04-25 | Charge window centered on cheapest hour, expanded outward |
 | Planner v2.5 | 2026-04-20 | Price ratios aligned with EMS v3.5 |
-| Planner v2.4 | 2026-04-19 | `currentPrice`/`avgPrice` from Frank Energie array; EnergyZero no longer price source |
+| Planner v2.4 | 2026-04-19 | Frank Energie as price source; EnergyZero removed as price source |
 | Planner v2.3 | 2026-04-17 | Version as single `PLANNER_VERSION` variable |
 | Planner v2.2 | 2026-04-15 | `SOC_NORMAL_THRESHOLD` raised to 80% |
 | Planner v2.1 | 2026-04-14 | Fixed `msg.plannerVersion` / `inWindow` undefined bugs |
