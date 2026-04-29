@@ -1,6 +1,8 @@
 # Battery EMS – Node-RED Setup & Reference Guide
 **EMS v3.11 / Planner v2.10** — Updated 26 April 2026
 
+![Node-red layout](NodeRed.png)
+
 ---
 
 ## My Setup
