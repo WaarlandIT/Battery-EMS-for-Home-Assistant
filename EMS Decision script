@@ -1,4 +1,10 @@
 // EMS Decision Engine
+// v3.17 - solar-aware charge rate: reduce grid charge amps proportionally
+//          when solar forecast covers part of kwhNeeded; keeps grid import low
+//          during cheap window while solar does the heavy lifting
+// v3.16 - solar overfill pre-discharge: discharge to solarPreDischargeTargetSoC
+//          when solar will fill battery before cheap window opens, creating room
+//          for cheap grid charging at the lowest price of the day
 // v3.15 - solar surplus charging suppressed during active discharge window;
 //          discharge takes priority over surplus absorption when inDischargeWindow=true
 // v3.14 - minimum discharge branch now suppressed when solar surplus
@@ -27,7 +33,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.15';
+var EMS_VERSION = 'EMS v3.17';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -73,7 +79,13 @@ var pac3       = parseFloat(msg.pac3)       || 0;
 var batterySoC = parseFloat(msg.batterySoC) || 50;
 
 var negPriceHoursRemaining  = parseInt(msg.negPriceHoursRemaining)  || 1;
-var inPreDischargeWindow    = msg.inPreDischargeWindow === true;
+var inPreDischargeWindow         = msg.inPreDischargeWindow === true;
+var inSolarPreDischargeWindow    = msg.inSolarPreDischargeWindow === true;
+var solarPreDischargeTargetSoC   = parseFloat(msg.solarPreDischargeTargetSoC) || 15;
+var kwhToFreeForSolar            = parseFloat(msg.kwhToFreeForSolar)    || 0;
+var solarAfterCheapWindow        = parseFloat(msg.solarAfterCheapWindow)  || 0;
+var kwhNeededForGrid             = parseFloat(msg.kwhNeededForGrid)        || 0;
+var MIN_SOLAR_GRID_FRACTION      = 0.20;
 var hoursUntilNegWindow     = parseFloat(msg.hoursUntilNegWindow) || 99;
 var futureNegHoursCount     = parseInt(msg.futureNegHoursCount)   || 0;
 
@@ -173,15 +185,31 @@ if (isNegPrice && canCharge) {
 
 } else if (isPriceLow && canCharge) {
   var priceDiscount = 1 - priceRatio;
-  var fraction      = Math.max(0.10, Math.min(1.0, 0.50 + (priceDiscount * 2.5)));  // FIX: clamp prevents negative amps when price > avg
-  charging   = true;
-  targetAmps = Math.round(maxAllowedChargeA * fraction);
-  if (batterySoC < CFG.SOC_CRITICAL) {
+  var fraction      = Math.max(0.10, Math.min(1.0, 0.50 + (priceDiscount * 2.5)));
+  charging = true;
+
+  if (batterySoC <= CFG.SOC_CRITICAL) {
     targetAmps = maxAllowedChargeA;
     reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
+
+  } else if (inChargingWindow && solarAfterCheapWindow > 0 && kwhNeededForGrid > 0) {
+    // Solar-aware rate: solar arriving after window covers part of kwhNeeded.
+    // Reduce grid charge proportionally — charge slower, let solar do the rest.
+    var solarCoverageRatio = Math.min(1.0, solarAfterCheapWindow / kwhNeededForGrid);
+    var solarAdjFraction   = Math.max(MIN_SOLAR_GRID_FRACTION, fraction * (1.0 - solarCoverageRatio));
+    targetAmps = Math.round(maxAllowedChargeA * solarAdjFraction);
+    reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR)'
+               + ' - charging at ' + targetAmps + ' A'
+               + ' (solar covers ' + Math.round(solarCoverageRatio * 100) + '% of grid need,'
+               + ' reduced from ' + Math.round(maxAllowedChargeA * fraction) + ' A)'
+               + '. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
+
   } else if (inChargingWindow) {
+    targetAmps = Math.round(maxAllowedChargeA * fraction);
     reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
+
   } else {
+    targetAmps = Math.round(maxAllowedChargeA * fraction);
     reason     = 'Price override: ' + Math.round(priceRatio * 100) + '% of avg (' + currentPrice.toFixed(3) + ' EUR) below threshold - charging at ' + targetAmps + ' A outside planned window';
   }
 
@@ -190,6 +218,19 @@ if (isNegPrice && canCharge) {
   charging   = true;
   targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);
   reason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';
+
+} else if (inSolarPreDischargeWindow && canDischarge && batterySoC > solarPreDischargeTargetSoC) {
+  // Solar overfill pre-discharge: solar will fill the battery before the cheap window opens.
+  // Discharge now to solarPreDischargeTargetSoC to create room for cheap grid charging.
+  var solarPreAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS,
+    Math.round((kwhToFreeForSolar * 1000) / CFG.BATTERY_VOLTAGE)
+  ));
+  discharging = true;
+  targetAmps  = solarPreAmps;
+  reason      = 'Solar pre-discharge: solar will fill battery before cheap window'
+              + ' - discharging ' + targetAmps + ' A'
+              + ' (target SoC ' + solarPreDischargeTargetSoC + '%'
+              + ', freeing ' + kwhToFreeForSolar.toFixed(1) + ' kWh for cheap grid charging)';
 
 } else if (inPreDischargeWindow && canDischarge) {
   // Pre-discharge: negative price window is coming — empty the battery now to free
