@@ -436,6 +436,7 @@ msg.plannedDischargeHours = expensiveHours;
 msg.hoursNeeded           = hoursNeeded;
 msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));
 msg.cheapestPrice              = cheapestPrice;
+msg.cheapestHour               = (typeof cheapestHour !== 'undefined') ? cheapestHour : null;
   msg.negPriceHoursRemaining     = negPriceHoursRemaining;
   msg.inPreDischargeWindow       = inPreDischargeWindow;
   msg.preDischargeHours          = preDischargeHours;
