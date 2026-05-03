@@ -1,4 +1,7 @@
 // EMS Decision Engine
+// v3.18 - EV charger integrated: evChargingW subtracted from netGridW and
+//          dischargeTargetW so battery never compensates for intentional EV load;
+//          EV Charge Controller v1.1 appended — outputs [battery_msg, ev_msg]
 // v3.17 - solar-aware charge rate: reduce grid charge amps proportionally
 //          when solar forecast covers part of kwhNeeded; keeps grid import low
 //          during cheap window while solar does the heavy lifting
@@ -33,7 +36,8 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.17';
+var EMS_VERSION = 'EMS v3.18';
+var EV_VERSION  = 'EV v1.2';
 
 var CFG = {
   MAX_AMPS:             200,
@@ -58,7 +62,11 @@ var CFG = {
   SAFETY_MARGIN_A:      2,
   MIN_DISCHARGE_A:      35,
   MIN_CHARGE_A:         10,  // minimum meaningful charge current (A)
-  SOLAR_SUPPRESS_DISCHARGE_W: 500  // suppress min-discharge when solar surplus exceeds this
+  SOLAR_SUPPRESS_DISCHARGE_W: 500, // suppress min-discharge when solar surplus exceeds this
+  EV_MAX_AMPS:          6,    // max EV charge amps
+  EV_SOLAR_MIN_W:       1400, // min solar surplus to start EV charging (6A × 230V)
+  EV_SOLAR_EXIT_W:      800,  // min solar surplus to keep EV charging
+  EV_RATE_LIMIT_MS:     15 * 60 * 1000  // 15 min between Zaptec writes
 };
 
 var currentPrice     = parseFloat(msg.currentPrice) || 0;
@@ -67,8 +75,15 @@ var inChargingWindow = msg.inChargingWindow;
 
 var gridImport       = parseFloat(msg.gridImport) || 0;
 var gridExport       = parseFloat(msg.gridExport) || 0;
-var netGridW         = (gridImport - gridExport) * 1000;
-var dischargeTargetW = gridImport * 1000;
+
+// EV load subtraction: if EV is charging from grid, subtract that load so the
+// battery doesn't compensate for intentional EV consumption.
+var zaptecMode    = msg.zaptecMode || '';
+var lastEvAmps    = context.get('evLastAmps') || 0;
+var evChargingW   = lastEvAmps * CFG.GRID_VOLTAGE;  // W being consumed by EV charger
+
+var netGridW         = Math.max(0, (gridImport - gridExport) * 1000 - evChargingW);
+var dischargeTargetW = Math.max(0, gridImport * 1000 - evChargingW);
 
 var phaseL1kW  = parseFloat(msg.phaseL1)   || 0;
 var phaseL2kW  = parseFloat(msg.phaseL2)   || 0;
@@ -351,7 +366,9 @@ msg.payload = {
     maxPhaseLoad_A:      parseFloat(maxPhaseLoadA.toFixed(2)),
     worstHeadroom_A:     parseFloat(worstPhaseHeadroomA.toFixed(2)),
     gridHeadroom_W:      parseFloat(gridHeadroomW.toFixed(0)),
-    maxAllowedCharge_A:  maxAllowedChargeA
+    maxAllowedCharge_A:  maxAllowedChargeA,
+    evCharging_W:        evChargingW,
+    evLastAmps:          lastEvAmps
   },
   timestamp: new Date().toISOString()
 };
@@ -362,4 +379,117 @@ node.status({
   text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
 });
 
-return msg;
+// ── EV Charge Controller v1.1 ─────────────────────────────────────────────
+var currentHour = new Date().getHours();
+// Runs in same cycle as EMS — uses values already calculated above.
+// Outputs a second message for the Zaptec api-call-service node.
+// Rate limited to max once per 15 minutes per Zaptec API recommendation.
+
+var evLastWriteTime = context.get('evLastWriteTime') || 0;
+var evTimeSince     = new Date().getTime() - evLastWriteTime;
+
+// Car connected if Zaptec mode indicates presence
+var evCarConnected = (
+  zaptecMode === 'connected_charging'   ||
+  zaptecMode === 'connected_finished'   ||
+  zaptecMode === 'connected_requesting' ||
+  zaptecMode === 'waiting'
+);
+
+var evTargetAmps = 0;
+var evReason     = '';
+
+if (!evCarConnected) {
+  evTargetAmps = 0;
+  evReason     = 'Car not connected (' + (zaptecMode || 'unknown') + ')';
+
+} else if (discharging) {
+  // Never charge EV while battery is discharging — would pull from battery via grid
+  evTargetAmps = 0;
+  evReason     = 'Battery discharging — EV paused to prevent battery draw';
+
+} else if (inChargingWindow && currentPrice <= chargeAbsMax) {
+  // Planned cheap window — charge EV at max
+  evTargetAmps = CFG.EV_MAX_AMPS;
+  evReason     = 'Cheap price window (' + currentPrice.toFixed(3) + ' EUR) - EV charging at ' + evTargetAmps + ' A';
+
+} else if (isPriceVeryLow) {
+  // Price override — below 80% of avg
+  evTargetAmps = CFG.EV_MAX_AMPS;
+  evReason     = 'Price override (' + currentPrice.toFixed(3) + ' EUR, ' + Math.round(priceRatio*100) + '% of avg) - EV charging at ' + evTargetAmps + ' A';
+
+} else if (actualSurplusW >= (lastEvAmps > 0 ? CFG.EV_SOLAR_EXIT_W : CFG.EV_SOLAR_MIN_W)) {
+  // Solar surplus — absorb export into EV instead of sending to grid
+  evTargetAmps = CFG.EV_MAX_AMPS;
+  evReason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W - EV charging at ' + evTargetAmps + ' A';
+
+} else if (msg.cheapestPrice !== null && msg.cheapestPrice !== undefined) {
+  // Fallback: always charge at the single cheapest hour of the day regardless of price cap.
+  // Unlike battery charging, EV charging uses cheapest available even if above avg.
+  //
+  // Use msg.cheapestHour if the planner passed it, otherwise check if current
+  // price equals cheapestPrice (within 0.001 EUR tolerance — we are in the cheapest hour).
+  var evCheapestHour = msg.cheapestHour !== undefined ? msg.cheapestHour : -1;
+  var evInCheapestHour;
+  if (evCheapestHour >= 0) {
+    // Planner passed the cheapest hour directly
+    evInCheapestHour = (currentHour === evCheapestHour);
+  } else {
+    // Fallback: compare current price to cheapestPrice within small tolerance
+    evInCheapestHour = (Math.abs(currentPrice - parseFloat(msg.cheapestPrice)) < 0.001);
+  }
+
+  if (evInCheapestHour) {
+    evTargetAmps = CFG.EV_MAX_AMPS;
+    evReason     = 'Cheapest hour fallback (' + currentPrice.toFixed(3) + ' EUR) - EV charging at ' + evTargetAmps + ' A (best available)';
+  } else {
+    evTargetAmps = 0;
+    evReason     = 'Waiting for cheapest hour' + (evCheapestHour >= 0 ? ' ' + evCheapestHour + 'h' : '') + ' (' + (msg.cheapestPrice || '?') + ' EUR) - EV paused (' + currentPrice.toFixed(3) + ' EUR)';
+  }
+
+} else {
+  evTargetAmps = 0;
+  evReason     = 'No charge condition met - EV paused (' + currentPrice.toFixed(3) + ' EUR, ' + Math.round(priceRatio*100) + '% of avg)';
+}
+
+// Rate limit — only write to Zaptec when amps changed or 15 min elapsed
+var evShouldWrite = (evTargetAmps !== lastEvAmps) || (evTimeSince >= CFG.EV_RATE_LIMIT_MS);
+
+if (evShouldWrite) {
+  context.set('evLastWriteTime', new Date().getTime());
+  context.set('evLastAmps', evTargetAmps);
+}
+
+// Build EV output message (second output of this node)
+var evMsg = {
+  payload: {
+    version:      EV_VERSION,
+    targetAmps:   parseFloat(evTargetAmps),
+    carConnected: evCarConnected,
+    reason:       evReason,
+    shouldWrite:  evShouldWrite,
+    inputs: {
+      zaptecMode:    zaptecMode,
+      currentPrice:  currentPrice,
+      avgPrice:      avgPrice,
+      surplus_W:     actualSurplusW,
+      discharging:   discharging,
+      lastEvAmps:      lastEvAmps,
+      cheapestHour:    msg.cheapestHour,
+      cheapestPrice:   msg.cheapestPrice,
+      evCheapestHour:  typeof evCheapestHour !== 'undefined' ? evCheapestHour : -1,
+      currentHour:     currentHour,
+      timeSince_s:     Math.round(evTimeSince / 1000)
+    }
+  },
+  evTargetAmps: evTargetAmps,
+  evShouldWrite: evShouldWrite
+};
+
+// Keep full diagnostic payload, expose amps as zaptecValue for api-call-service node
+// Use {{zaptecValue}} in the Set Zaptec Current node data field
+evMsg.zaptecValue = parseFloat(evTargetAmps);
+
+// Return [battery_msg, ev_msg_or_null]
+// EV msg is null when rate limited and amps unchanged — suppresses Zaptec write
+return [ msg, evShouldWrite ? evMsg : null ];
