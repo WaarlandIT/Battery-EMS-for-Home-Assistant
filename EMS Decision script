@@ -1,4 +1,29 @@
 // EMS Decision Engine
+// v3.45 - actualSurplusW calculated from raw netGrid before clamp;
+//          fixes solar surplus not detected when EV load subtraction pushes
+//          netGridW to 0 even though grid is exporting
+// v3.44 - EV session accumulator: tracks kWh, actual cost, public cost (50ct)
+//          and saving vs public charger; resets on car disconnect; writes to
+//          HA helpers via msg.evSession output on evMsg
+// v3.43 - dc_amps only set when charging (0 when discharging);
+//          dc_power only set when discharging (0 when charging)
+// v3.42 - MAX_AMPS reduced to 100A
+// v3.41 - MAX_AMPS reduced to 125A
+// v3.40 - solar-aware charge rate removed during planned cheap window;
+//          always charge at full amps when inChargingWindow=true
+// v3.39 - SOC_CRITICAL lowered to 15%; critical charge capped at avg × 0.70;
+//          night EV min 8A; EV solar surplus scaling; 6A cap during discharge
+// v3.36b - night minimum raised to 8A; EV charges at min 8A during
+//           00h-06h window, up to 10A when 3-phase headroom allows
+// v3.36 - EV capped at 6A single phase when battery is discharging;
+//          prevents EV scaling up during discharge and pulling extra from grid
+// v3.35 - EV follows solar surplus during day: sizes amps to keep grid
+//          import at 0; scales up on 3-phase when surplus allows >= 7A
+// v3.34 - EV charging rules:
+//          baseline 6A 24/7 (single phase L1 below 7A, 3-phase at 7A+);
+//          night 00h-06h max 10A on 3-phase;
+//          L1-only: cut after 3 cycles >18A OR instantly >20A;
+//          3-phase switch-back: confirm all phases have headroom
 // v3.28 - EV always respects grid phase limit; evSafeAmps caps all EV
 //          charging at available phase headroom — including mandatory night window;
 //          EV pauses if headroom < EV minimum (6A) to prevent blown fuse
@@ -56,17 +81,17 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.28';
-var EV_VERSION  = 'EV v1.2';
+var EMS_VERSION = 'EMS v3.45';
+var EV_VERSION  = 'EV v2.0';
 
 var CFG = {
-  MAX_AMPS:             200,
+  MAX_AMPS:             100,  // safe limit
   BATTERY_VOLTAGE:      48,
   BATTERY_KWH:          40,
   SOC_MIN:              10,
   SOC_MAX:              95,
   SOC_DISCHARGE_MIN:    15,
-  SOC_CRITICAL:         20,
+  SOC_CRITICAL:         15,  // emergency charge threshold — below discharge floor
   CHARGE_THRESHOLD:     0.80,
   DISCHARGE_THRESHOLD:  1.20,
   CHARGE_ABS_RATIO:     0.55,
@@ -86,7 +111,8 @@ var CFG = {
   EV_MAX_AMPS:          6,    // max EV charge amps per phase (3-phase — 6A on all 3 phases)
   EV_SOLAR_MIN_W:       4200, // min solar surplus to start EV charging (6A × 230V × 3 phases)
   EV_SOLAR_EXIT_W:      2400, // min solar surplus to keep EV charging (3-phase)
-  EV_RATE_LIMIT_MS:     15 * 60 * 1000  // 15 min between Zaptec writes
+  EV_RATE_LIMIT_MS:     15 * 60 * 1000, // 15 min between Zaptec writes
+  EV_PUBLIC_RATE:       0.50  // public charger reference rate (€/kWh)
 };
 
 var currentPrice     = parseFloat(msg.currentPrice) || 0;
@@ -106,7 +132,8 @@ var evChargingW   = (msg.EVChargeLoad !== undefined && msg.EVChargeLoad !== null
   ? parseFloat(msg.EVChargeLoad) || 0     // actual measured W from sensor
   : lastEvAmps * CFG.GRID_VOLTAGE * 3;   // fallback: commanded amps × 3-phase
 
-var netGridW         = Math.max(0, (gridImport - gridExport) * 1000 - evChargingW);
+var rawNetGridW      = (gridImport - gridExport) * 1000 - evChargingW;
+var netGridW         = Math.max(0, rawNetGridW);
 var dischargeTargetW = Math.max(0, gridImport * 1000 - evChargingW);
 
 var phaseL1kW  = parseFloat(msg.phaseL1)   || 0;
@@ -133,7 +160,10 @@ var pendingState = context.get('pendingState') || 'idle';
 var pendingCount = context.get('pendingCount') || 0;
 
 var solarTotalW    = pac1 + pac2 + pac3;
-var actualSurplusW = (netGridW < 0 && solarTotalW > 50 && Math.abs(netGridW) <= solarTotalW * 1.3) ? Math.abs(netGridW) : 0;
+// Use rawNetGridW (before clamp) to detect solar surplus correctly
+// even when EV load subtraction pushes netGridW to 0
+var actualSurplusW = (rawNetGridW < 0 && solarTotalW > 50)
+  ? Math.min(Math.abs(rawNetGridW), solarTotalW) : 0;
 
 var priceRatio  = avgPrice > 0 ? currentPrice / avgPrice : 1;
 var isNegPrice  = currentPrice < 0;
@@ -147,8 +177,10 @@ var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESH
 
 var isPriceLow;
 var isPriceVeryLow = priceRatio <= CFG.CHARGE_THRESHOLD && currentPrice <= chargeAbsMax;  // ratio override
-if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice) {
-  // Critical SoC — charge in any below-average hour regardless of window
+var chargeCriticalMax = avgPrice * 0.70;  // more lenient than chargeAbsMax for critical SoC
+if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <= chargeCriticalMax) {
+  // Critical SoC — charge if price is reasonably cheap (below avg × 0.70)
+  // Prevents charging at 90% of avg but allows charging at 70% of avg
   isPriceLow = true;
 } else if (inChargingWindow === null) {
   // No planner data — use ratio fallback
@@ -231,19 +263,10 @@ if (isNegPrice && canCharge) {
     targetAmps = maxAllowedChargeA;
     reason     = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
 
-  } else if (inChargingWindow && solarAfterCheapWindow > 0 && kwhNeededForGrid > 0) {
-    // Solar-aware rate: solar arriving after window covers part of kwhNeeded.
-    // Reduce grid charge proportionally — charge slower, let solar do the rest.
-    var solarCoverageRatio = Math.min(1.0, solarAfterCheapWindow / kwhNeededForGrid);
-    var solarAdjFraction   = Math.max(MIN_SOLAR_GRID_FRACTION, fraction * (1.0 - solarCoverageRatio));
-    targetAmps = Math.round(maxAllowedChargeA * solarAdjFraction);
-    reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR)'
-               + ' - charging at ' + targetAmps + ' A'
-               + ' (solar covers ' + Math.round(solarCoverageRatio * 100) + '% of grid need,'
-               + ' reduced from ' + Math.round(maxAllowedChargeA * fraction) + ' A)'
-               + '. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
-
   } else if (inChargingWindow) {
+    // Cheap window — charge at full amps regardless of solar forecast.
+    // Solar will contribute on top; grid fills the battery as fast as possible
+    // while price is at its lowest. Never reduce rate during cheap window.
     targetAmps = Math.round(maxAllowedChargeA * fraction);
     reason     = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
 
@@ -355,9 +378,15 @@ if (targetAmps === 0) {
   discharging = false;
 }
 
+// dc_amps = charging current (A) when charging, 0 when discharging
+// dc_power = discharge power (W) when discharging, 0 when charging
+var dc_amps  = charging   ? targetAmps : 0;
+var dc_power = discharging ? targetAmps * CFG.BATTERY_VOLTAGE : 0;
+
 msg.payload = {
   version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),
-  dc_amps:     targetAmps,
+  dc_amps:     dc_amps,
+  dc_power:    dc_power,
   charging:    charging,
   discharging: discharging,
   reason:      reason,
@@ -404,48 +433,141 @@ node.status({
   text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
 });
 
-// ── EV Charge Controller v1.1 ─────────────────────────────────────────────
+// ── EV Charge Controller v2.0 ─────────────────────────────────────────────
+// EV charging rules:
+//   BASELINE: always charge at minimum 6A (single phase L1) when car connected
+//             unless L1 is overloaded — 6A is the 24h baseline, never goes lower
+//   PHASE:    < 7A commanded → Zaptec uses L1 only → check L1 headroom only
+//             >= 7A commanded → Zaptec uses 3-phase → check all 3 phases
+//   NIGHT:    00h-06h max 10A on 3-phase when all phases have headroom
+//   BLACKOUT: 17h-19h no charging (cooking peak)
+//   L1 SAFETY: cut session after 3 cycles >18A, OR immediately >20A
+//   RESUME:   back to 6A L1 when L1 drops below 18A again
+
 var currentHour = new Date().getHours();
 
-// EV blackout window — no charging during cooking/peak hours regardless of price
-var EV_BLACKOUT_START  = 17;   // inclusive
-var EV_BLACKOUT_END    = 19;   // exclusive — charging resumes at 19:00
-var EV_NIGHT_START     = 1;    // inclusive — night mode start
-var EV_NIGHT_END       = 6;    // exclusive — night mode end
-var EV_NIGHT_MAX_AMPS  = 10;   // max amps per phase during night mode (headroom limited)
-var EV_NIGHT_AMPS      = 8;    // mandatory night charge amps per phase (01h-06h, always)
+// ── Time windows ─────────────────────────────────────────────────────────────
+var EV_BLACKOUT_START = 17;
+var EV_BLACKOUT_END   = 19;
+var EV_NIGHT_START    = 0;   // midnight
+var EV_NIGHT_END      = 6;
 var evInBlackout = currentHour >= EV_BLACKOUT_START && currentHour < EV_BLACKOUT_END;
 var evInNight    = currentHour >= EV_NIGHT_START && currentHour < EV_NIGHT_END;
 
-// Calculate effective EV max amps for this cycle
-// In night mode, allow up to EV_NIGHT_MAX_AMPS but cap at available phase headroom.
-// worstPhaseHeadroomA is calculated before EV load, so add back current EV amps
-// to get true headroom available for EV use.
-var evCurrentPerPhase  = lastEvAmps;  // EV is balanced 3-phase so amps = per-phase
-var evAvailableAmps    = Math.floor(worstPhaseHeadroomA + evCurrentPerPhase - CFG.SAFETY_MARGIN_A);
-var evEffectiveMax     = evInNight
-  ? Math.min(EV_NIGHT_MAX_AMPS, Math.max(CFG.EV_MAX_AMPS, evAvailableAmps))
-  : CFG.EV_MAX_AMPS;
+// ── Phase loads (true values — add back EV's own current share) ───────────────
+var evCurrentPerPhase = lastEvAmps;  // 3-phase balanced → per-phase amps = commanded
+var phaseL1LoadA = (phaseL1kW * 1000 / CFG.GRID_VOLTAGE) + evCurrentPerPhase;
+var phaseL2LoadA = (phaseL2kW * 1000 / CFG.GRID_VOLTAGE) + evCurrentPerPhase;
+var phaseL3LoadA = (phaseL3kW * 1000 / CFG.GRID_VOLTAGE) + evCurrentPerPhase;
 
-// Safety cap: EV must never exceed available phase headroom to prevent blown fuse.
-// worstPhaseHeadroomA already accounts for home load on all phases.
-// Add back current EV amps since headroom was calculated when EV was already running.
-// Result is clamped to [0, evEffectiveMax].
-var evHeadroomAmps = Math.floor(worstPhaseHeadroomA + evCurrentPerPhase - CFG.SAFETY_MARGIN_A);
-var evSafeAmps     = Math.max(0, Math.min(evEffectiveMax, evHeadroomAmps));
+// ── Solar surplus available for EV ──────────────────────────────────────────
+// gridExportW = how much is currently being exported to grid (after EV load subtraction)
+// This is free solar energy going to waste — EV should absorb it first.
+// We leave a SOLAR_EV_MARGIN_W buffer to avoid oscillating at the boundary.
+var SOLAR_EV_MARGIN_W  = 200;   // W buffer to prevent grid import oscillation
+var gridExportW        = Math.max(0, (gridExport - gridImport) * 1000 - evChargingW);
+// amps available per phase from solar surplus (3-phase distribution)
+var solarSurplusPerPhaseA = Math.floor((gridExportW - SOLAR_EV_MARGIN_W) / CFG.GRID_VOLTAGE / 3);
+// total export amps on single phase basis (for L1 check)
+var solarSurplusL1A    = Math.floor((gridExportW - SOLAR_EV_MARGIN_W) / CFG.GRID_VOLTAGE);
+var hasSolarSurplus    = gridExportW > SOLAR_EV_MARGIN_W;
 
-// If safe amps is below Zaptec minimum (6A), pause rather than command invalid current
-var EV_MIN_AMPS    = CFG.EV_MAX_AMPS;  // 6A — Zaptec minimum charge current
-var evCanCharge    = evSafeAmps >= EV_MIN_AMPS;
+// ── L1 overload detection (dual threshold with hysteresis) ────────────────────
+var EV_L1_HARD_LIMIT     = 20;   // immediate session cut
+var EV_L1_WARN_LIMIT     = 18;   // soft warning — reduce + count cycles
+var EV_L1_OVERLOAD_CYCLES = 3;   // cycles at warn before cutting session
 
-// Runs in same cycle as EMS — uses values already calculated above.
-// Outputs a second message for the Zaptec api-call-service node.
-// Rate limited to max once per 15 minutes per Zaptec API recommendation.
+var l1HardOverload = phaseL1LoadA > EV_L1_HARD_LIMIT;
+var l1WarnOverload = phaseL1LoadA > EV_L1_WARN_LIMIT && !l1HardOverload;
+var l1OverloadCount = context.get('l1OverloadCount') || 0;
+if (l1WarnOverload) { l1OverloadCount++; } else { l1OverloadCount = 0; }
+context.set('l1OverloadCount', l1OverloadCount);
+// Persistent cut when: hard limit exceeded (instant) OR warn limit for N cycles
+var l1SessionCut = l1HardOverload || (l1WarnOverload && l1OverloadCount >= EV_L1_OVERLOAD_CYCLES);
 
+// ── Phase headroom calculation ────────────────────────────────────────────────
+// L1 headroom (for single-phase mode, < 7A)
+var l1HeadroomA = Math.max(0, EV_L1_HARD_LIMIT - phaseL1LoadA);
+
+// 3-phase headroom (worst of all 3 phases)
+var l2HeadroomA = Math.max(0, EV_L1_HARD_LIMIT - phaseL2LoadA);
+var l3HeadroomA = Math.max(0, EV_L1_HARD_LIMIT - phaseL3LoadA);
+var worst3PhaseA = Math.min(l1HeadroomA, l2HeadroomA, l3HeadroomA);
+
+// ── Determine safe amps and phase mode ───────────────────────────────────────
+// Zaptec rules: commanded < 7A → L1 only; commanded >= 7A → 3-phase
+// Night max: 10A on 3-phase
+// Baseline: always 6A minimum (L1 only) unless L1 session cut
+var EV_MIN_AMPS      = 6;   // Zaptec minimum — always target this as baseline
+var EV_3PHASE_MIN_A  = 7;   // 3-phase kicks in at this threshold
+var EV_NIGHT_MAX     = 10;  // max amps during night window
+var EV_NIGHT_MIN     = 8;   // minimum amps during night window
+
+var evSafeAmps;
+var evPhaseMode;
+var evCanCharge;
+
+if (l1SessionCut) {
+  // L1 persistently or acutely overloaded — end session
+  evSafeAmps  = 0;
+  evPhaseMode = 'paused-L1-overload';
+  evCanCharge = false;
+
+} else if (worst3PhaseA >= EV_3PHASE_MIN_A) {
+  // All 3 phases have headroom for 3-phase charging
+  // During night: max EV_NIGHT_MAX amps
+  // During day with solar surplus: scale to surplus (keep grid at 0)
+  // Otherwise: baseline EV_MIN_AMPS
+  var maxAllowed;
+  if (evInNight) {
+    maxAllowed = EV_NIGHT_MAX;
+    // Night minimum is 8A — override lower values
+  } else if (hasSolarSurplus && solarSurplusPerPhaseA >= EV_3PHASE_MIN_A) {
+    // Size to solar surplus — add current EV amps back since they're already in export calc
+    maxAllowed = Math.min(16, solarSurplusPerPhaseA + evCurrentPerPhase);
+  } else {
+    maxAllowed = EV_MIN_AMPS;
+  }
+  var candidate3 = Math.min(maxAllowed, Math.floor(worst3PhaseA));
+  if (candidate3 >= EV_3PHASE_MIN_A) {
+    // Enough for 3-phase
+    evSafeAmps  = candidate3;
+    evPhaseMode = '3-phase';
+  } else {
+    // Headroom allows 3-phase but target is below 7A threshold — use L1 at 6A baseline
+    evSafeAmps  = EV_MIN_AMPS;
+    evPhaseMode = 'single-phase-L1';
+  }
+  // Enforce night minimum: at least 8A if night and can charge
+  if (evInNight && evCanCharge && evSafeAmps < EV_NIGHT_MIN && !l1SessionCut) {
+    evSafeAmps  = EV_NIGHT_MIN;
+    evPhaseMode = '3-phase';  // 8A always triggers 3-phase (>= 7A threshold)
+  }
+  evCanCharge = true;
+
+} else {
+  // Not enough headroom for 3-phase — use L1 single phase
+  // Solar surplus on L1: scale up if surplus allows, otherwise baseline 6A
+  if (hasSolarSurplus && solarSurplusL1A + evCurrentPerPhase > EV_MIN_AMPS && !evInNight) {
+    // Size to L1 surplus but stay below 7A (above 7 would trigger 3-phase)
+    evSafeAmps = Math.min(EV_3PHASE_MIN_A - 1, solarSurplusL1A + evCurrentPerPhase);
+    evSafeAmps = Math.max(EV_MIN_AMPS, evSafeAmps);
+  } else if (evInNight) {
+    // At night, try to get at least EV_NIGHT_MIN even on L1 if 3-phase not available
+    // Stay below 7A to remain on single phase (safety — not enough 3-phase headroom)
+    evSafeAmps = Math.min(EV_3PHASE_MIN_A - 1, EV_NIGHT_MIN - 1);  // max 6A on L1
+    evSafeAmps = Math.max(EV_MIN_AMPS, evSafeAmps);  // floor at 6A
+  } else {
+    evSafeAmps = EV_MIN_AMPS;  // 6A baseline on L1
+  }
+  evPhaseMode = 'single-phase-L1';
+  evCanCharge = true;
+}
+
+// ── Car connected? ────────────────────────────────────────────────────────────
 var evLastWriteTime = context.get('evLastWriteTime') || 0;
 var evTimeSince     = new Date().getTime() - evLastWriteTime;
 
-// Car connected if Zaptec mode indicates presence
 var evCarConnected = (
   zaptecMode === 'connected_charging'   ||
   zaptecMode === 'connected_finished'   ||
@@ -453,6 +575,7 @@ var evCarConnected = (
   zaptecMode === 'waiting'
 );
 
+// ── EV Decision ───────────────────────────────────────────────────────────────
 var evTargetAmps = 0;
 var evReason     = '';
 
@@ -460,71 +583,101 @@ if (!evCarConnected) {
   evTargetAmps = 0;
   evReason     = 'Car not connected (' + (zaptecMode || 'unknown') + ')';
 
-} else if (evInNight && evCanCharge) {
-  // Mandatory night charging 01h-06h — charge at EV_NIGHT_AMPS capped by phase headroom
-  evTargetAmps = Math.min(EV_NIGHT_AMPS, evSafeAmps);
-  evReason     = 'Night charging (' + currentPrice.toFixed(3) + ' EUR) - EV charging at ' + evTargetAmps + ' A per phase (mandatory 01h-06h, headroom: ' + evHeadroomAmps.toFixed(1) + ' A)';
-
-} else if (evInNight && !evCanCharge) {
+} else if (!evCanCharge) {
+  // L1 overloaded — cut session
   evTargetAmps = 0;
-  evReason     = 'Night charging paused — insufficient phase headroom (' + evHeadroomAmps.toFixed(1) + ' A available, need ' + EV_MIN_AMPS + ' A min) — preventing blown fuse';
+  evReason     = (l1HardOverload ? 'L1 instant overload' : 'L1 persistent overload')
+               + ' (' + phaseL1LoadA.toFixed(1) + ' A) — session cut to protect fuse';
 
-} else if (inChargingWindow && currentPrice <= chargeAbsMax && evCanCharge) {
-  evTargetAmps = evSafeAmps;
-  evReason     = 'Cheap price window (' + currentPrice.toFixed(3) + ' EUR) - EV charging at ' + evTargetAmps + ' A (headroom: ' + evHeadroomAmps.toFixed(1) + ' A)';
-
-} else if (isPriceVeryLow && evCanCharge) {
-  evTargetAmps = evSafeAmps;
-  evReason     = 'Price override (' + currentPrice.toFixed(3) + ' EUR, ' + Math.round(priceRatio*100) + '% of avg) - EV charging at ' + evTargetAmps + ' A (headroom: ' + evHeadroomAmps.toFixed(1) + ' A)';
-
-} else if (actualSurplusW >= (lastEvAmps > 0 ? CFG.EV_SOLAR_EXIT_W : CFG.EV_SOLAR_MIN_W) && evCanCharge) {
-  evTargetAmps = evSafeAmps;
-  evReason     = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W - EV charging at ' + evTargetAmps + ' A (headroom: ' + evHeadroomAmps.toFixed(1) + ' A)';
-
-} else if (msg.cheapestPrice !== null && msg.cheapestPrice !== undefined) {
-  // Fallback: charge at cheapest hour of the day — but only if that price is
-  // below avgPrice. If all remaining hours are above average it's not worth
-  // charging the EV at all — wait for a better day.
-  var evCheapestHour = (msg.cheapestHour !== undefined && msg.cheapestHour !== null) ? parseInt(msg.cheapestHour) : -1;
-  var evInCheapestHour;
-  if (evCheapestHour >= 0) {
-    evInCheapestHour = (currentHour === evCheapestHour);
-  } else {
-    evInCheapestHour = (Math.abs(currentPrice - parseFloat(msg.cheapestPrice)) < 0.001);
-  }
-
-  // Only use fallback if cheapest hour is genuinely cheap (below avgPrice × 0.55).
-  // Using avgPrice alone is too loose — on flat-price days cheapest may be 99% of avg.
-  var evFallbackPriceOk = parseFloat(msg.cheapestPrice) <= chargeAbsMax;
-
-  if (evInCheapestHour && evFallbackPriceOk) {
-    evTargetAmps = evCanCharge ? evSafeAmps : 0;
-    evReason     = evCanCharge
-      ? 'Cheapest hour fallback (' + currentPrice.toFixed(3) + ' EUR) - EV charging at ' + evTargetAmps + ' A (headroom: ' + evHeadroomAmps.toFixed(1) + ' A)'
-      : 'Cheapest hour but insufficient headroom (' + evHeadroomAmps.toFixed(1) + ' A) - EV paused';
-  } else if (evInCheapestHour && !evFallbackPriceOk) {
-    evTargetAmps = 0;
-    evReason     = 'Cheapest hour (' + currentPrice.toFixed(3) + ' EUR) is above avg (' + avgPrice.toFixed(3) + ' EUR) - EV paused, no cheap hours today';
-  } else {
-    evTargetAmps = 0;
-    evReason     = 'Waiting for cheapest hour' + (evCheapestHour >= 0 ? ' ' + evCheapestHour + 'h' : '') + ' (' + (msg.cheapestPrice || '?') + ' EUR) - EV paused (' + currentPrice.toFixed(3) + ' EUR)';
-  }
+} else if (evInBlackout) {
+  // Blackout window — but still send minimum 6A to keep session alive
+  // Only fully pause if L1 headroom is insufficient
+  evTargetAmps = EV_MIN_AMPS;
+  evPhaseMode  = 'single-phase-L1';
+  evReason     = 'Blackout window ' + EV_BLACKOUT_START + 'h-' + EV_BLACKOUT_END + 'h (cooking peak) - maintaining ' + evTargetAmps + 'A minimum [L1]';
 
 } else {
-  evTargetAmps = 0;
-  evReason     = 'No charge condition met - EV paused (' + currentPrice.toFixed(3) + ' EUR, ' + Math.round(priceRatio*100) + '% of avg)';
+  // Normal charging — always at least 6A (baseline), up to evSafeAmps
+  // When battery is discharging, cap at 6A single phase to avoid pulling extra from grid
+  if (discharging) {
+    evTargetAmps = EV_MIN_AMPS;
+    evPhaseMode  = 'single-phase-L1';
+  } else {
+    evTargetAmps = evSafeAmps;
+  }
+
+  if (evInNight && evPhaseMode === '3-phase') {
+    evReason = 'Night charging (' + currentPrice.toFixed(3) + ' EUR) - ' + evTargetAmps + 'A [3-phase, max ' + EV_NIGHT_MAX + 'A] (headroom: L1=' + l1HeadroomA.toFixed(0) + ' L2=' + l2HeadroomA.toFixed(0) + ' L3=' + l3HeadroomA.toFixed(0) + ')';
+  } else if (evPhaseMode === '3-phase') {
+    evReason = 'Charging ' + evTargetAmps + 'A [3-phase] (headroom: worst=' + Math.floor(worst3PhaseA) + 'A)';
+  } else {
+    evReason = 'Charging ' + evTargetAmps + 'A [L1 single-phase] (L1 headroom: ' + l1HeadroomA.toFixed(0) + 'A)';
+  }
+
+  // Annotate reason with price/solar context
+  if (discharging) {
+    evReason += ' — battery discharging, capped at 6A baseline';
+  } else if (inChargingWindow && currentPrice <= chargeAbsMax) {
+    evReason += ' — cheap price window (' + currentPrice.toFixed(3) + ' EUR)';
+  } else if (isPriceVeryLow) {
+    evReason += ' — price override (' + currentPrice.toFixed(3) + ' EUR, ' + Math.round(priceRatio*100) + '% of avg)';
+  } else if (hasSolarSurplus) {
+    evReason += ' — solar surplus ' + gridExportW.toFixed(0) + 'W exported (' + currentPrice.toFixed(3) + ' EUR)';
+  } else {
+    evReason += ' — baseline (' + currentPrice.toFixed(3) + ' EUR)';
+  }
 }
 
-// Rate limit — only write to Zaptec when amps changed or 15 min elapsed
-var evShouldWrite = (evTargetAmps !== lastEvAmps) || (evTimeSince >= CFG.EV_RATE_LIMIT_MS);
+// ── EV Session accumulator ────────────────────────────────────────────────────
+// Tracks kWh and cost since car connected. Resets on disconnect.
+// Uses EVChargeLoad (W) and cycle interval to estimate kWh per cycle.
+var evLastCycleTime = context.get('evLastCycleTime') || 0;
+var evNowMs         = new Date().getTime();
+var evCycleSeconds  = evLastCycleTime > 0 ? (evNowMs - evLastCycleTime) / 1000 : 0;
+context.set('evLastCycleTime', evNowMs);
 
+// Reset session when car disconnects
+var evWasConnected = context.get('evWasConnected') || false;
+if (!evCarConnected && evWasConnected) {
+    // Car just disconnected — reset session
+    context.set('evSessionKwh',    0);
+    context.set('evSessionCostAct', 0);
+    context.set('evSessionCostPub', 0);
+}
+context.set('evWasConnected', evCarConnected);
+
+// Accumulate kWh and cost if EV is charging
+var evSessionKwh     = context.get('evSessionKwh')     || 0;
+var evSessionCostAct = context.get('evSessionCostAct') || 0;
+var evSessionCostPub = context.get('evSessionCostPub') || 0;
+
+var evChargingNowW = parseFloat(msg.EVChargeLoad) || 0;
+if (evCarConnected && evChargingNowW > 0 && evCycleSeconds > 0 && evCycleSeconds < 300) {
+    var evCycleKwh    = (evChargingNowW / 1000) * (evCycleSeconds / 3600);
+    evSessionKwh     += evCycleKwh;
+    evSessionCostAct += evCycleKwh * currentPrice;
+    evSessionCostPub += evCycleKwh * CFG.EV_PUBLIC_RATE;
+    context.set('evSessionKwh',     evSessionKwh);
+    context.set('evSessionCostAct', evSessionCostAct);
+    context.set('evSessionCostPub', evSessionCostPub);
+}
+
+// Instantaneous rates (€/h)
+var evInstantKw      = evChargingNowW / 1000;
+var evInstantCostAct = evInstantKw * currentPrice;          // €/h at current price
+var evInstantCostPub = evInstantKw * CFG.EV_PUBLIC_RATE;   // €/h at public rate
+var evInstantSaving  = evInstantCostPub - evInstantCostAct; // saving vs public €/h
+var evSessionSaving  = evSessionCostPub - evSessionCostAct; // total saving this session
+
+// ── Rate limit ────────────────────────────────────────────────────────────────
+var evShouldWrite = (evTargetAmps !== lastEvAmps) || (evTimeSince >= CFG.EV_RATE_LIMIT_MS);
 if (evShouldWrite) {
   context.set('evLastWriteTime', new Date().getTime());
   context.set('evLastAmps', evTargetAmps);
 }
 
-// Build EV output message (second output of this node)
-var evCharging = evTargetAmps > 0;  // true = turn switch on, false = turn switch off
+// ── Build EV output message ───────────────────────────────────────────────────
+var evCharging = evTargetAmps > 0;
 
 var evMsg = {
   payload: {
@@ -535,35 +688,56 @@ var evMsg = {
     reason:       evReason,
     shouldWrite:  evShouldWrite,
     inputs: {
-      zaptecMode:    zaptecMode,
-      currentPrice:  currentPrice,
-      avgPrice:      avgPrice,
-      surplus_W:     actualSurplusW,
-      discharging:   discharging,
-      lastEvAmps:      lastEvAmps,
-      cheapestHour:    msg.cheapestHour,
-      cheapestPrice:   msg.cheapestPrice,
-      evCheapestHour:  typeof evCheapestHour !== 'undefined' ? evCheapestHour : -1,
-      currentHour:     currentHour,
-      evInBlackout:    evInBlackout,
-      evInNight:       evInNight,
-      evEffectiveMax:  evEffectiveMax,
-      evNightAmps:     EV_NIGHT_AMPS,
-      evHeadroomAmps:  evHeadroomAmps,
-      evSafeAmps:      evSafeAmps,
-      evCanCharge:     evCanCharge,
-      timeSince_s:     Math.round(evTimeSince / 1000)
+      zaptecMode:       zaptecMode,
+      currentPrice:     currentPrice,
+      avgPrice:         avgPrice,
+      surplus_W:        actualSurplusW,
+      lastEvAmps:       lastEvAmps,
+      cheapestHour:     msg.cheapestHour,
+      cheapestPrice:    msg.cheapestPrice,
+      currentHour:      currentHour,
+      evInBlackout:     evInBlackout,
+      evInNight:        evInNight,
+      evPhaseMode:      evPhaseMode,
+      evSafeAmps:       evSafeAmps,
+      evCanCharge:      evCanCharge,
+      phaseL1LoadA:     parseFloat(phaseL1LoadA.toFixed(2)),
+      phaseL2LoadA:     parseFloat(phaseL2LoadA.toFixed(2)),
+      phaseL3LoadA:     parseFloat(phaseL3LoadA.toFixed(2)),
+      l1HeadroomA:      parseFloat(l1HeadroomA.toFixed(1)),
+      l2HeadroomA:      parseFloat(l2HeadroomA.toFixed(1)),
+      l3HeadroomA:      parseFloat(l3HeadroomA.toFixed(1)),
+      worst3PhaseA:     parseFloat(worst3PhaseA.toFixed(1)),
+      l1HardOverload:   l1HardOverload,
+      l1WarnOverload:   l1WarnOverload,
+      l1OverloadCount:  l1OverloadCount,
+      l1SessionCut:     l1SessionCut,
+      gridExportW:      parseFloat(gridExportW.toFixed(0)),
+      solarSurplusPerPhaseA: solarSurplusPerPhaseA,
+      hasSolarSurplus:  hasSolarSurplus,
+      timeSince_s:        Math.round(evTimeSince / 1000)
+    },
+    session: {
+      kwh:          parseFloat(evSessionKwh.toFixed(3)),
+      costActual:   parseFloat(evSessionCostAct.toFixed(4)),
+      costPublic:   parseFloat(evSessionCostPub.toFixed(4)),
+      saving:       parseFloat(evSessionSaving.toFixed(4)),
+      instantKw:    parseFloat(evInstantKw.toFixed(3)),
+      instantCostAct: parseFloat(evInstantCostAct.toFixed(4)),
+      instantCostPub: parseFloat(evInstantCostPub.toFixed(4)),
+      instantSaving:  parseFloat(evInstantSaving.toFixed(4))
     }
   },
-  evTargetAmps: evTargetAmps,
+  evTargetAmps:  evTargetAmps,
   evCharging:    evCharging,
-  evShouldWrite: evShouldWrite
+  evShouldWrite:      evShouldWrite,
+  zaptecValue:        parseFloat(evTargetAmps),
+  evSessionKwh:       parseFloat(evSessionKwh.toFixed(3)),
+  evSessionCostAct:   parseFloat(evSessionCostAct.toFixed(4)),
+  evSessionCostPub:   parseFloat(evSessionCostPub.toFixed(4)),
+  evSessionSaving:    parseFloat(evSessionSaving.toFixed(4)),
+  evInstantCostAct:   parseFloat(evInstantCostAct.toFixed(4)),
+  evInstantCostPub:   parseFloat(evInstantCostPub.toFixed(4))
 };
 
-// Keep full diagnostic payload, expose amps as zaptecValue for api-call-service node
-// Use {{zaptecValue}} in the Set Zaptec Current node data field
-evMsg.zaptecValue = parseFloat(evTargetAmps);
-
-// Return [battery_msg, ev_msg]
-// Output 2 always fires — rate limiting handled in downstream EV Output Router node
 return [ msg, evMsg ];
