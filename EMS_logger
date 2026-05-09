@@ -1,0 +1,142 @@
+// EMS Combined Logger v1.3
+// Changes from v1.1:
+//   - function declarations replaced with var expressions (Node-RED sandbox fix)
+// Changes from v1.0:
+//   - Timestamps in CET (UTC+1) / CEST (UTC+2) instead of UTC
+//   - Battery deduplication: only logs when state, SoC or amps changes
+//   - Daily log rotation uses local date (midnight Amsterdam, not UTC)
+
+var LOGGER_VERSION = 'Logger v1.3';
+
+// ── CET/CEST timestamp ────────────────────────────────────────────────────────
+var getLastSunday = function(y, m) {
+    // Last Sunday of month m (0-based) at 01:00 UTC
+    var d = new Date(Date.UTC(y, m + 1, 0));
+    d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+    d.setUTCHours(1, 0, 0, 0);
+    return d.getTime();
+};
+var pad = function(n) { return String(n).padStart(2, '0'); };
+
+var now      = new Date();
+var utcMs    = now.getTime();
+var year     = now.getUTCFullYear();
+var dstStart = getLastSunday(year, 2);   // last Sunday March
+var dstEnd   = getLastSunday(year, 9);   // last Sunday October
+var isDST    = utcMs >= dstStart && utcMs < dstEnd;
+var offsetMs = isDST ? 2 * 3600000 : 1 * 3600000;
+var local    = new Date(utcMs + offsetMs);
+
+var isoNow = local.getUTCFullYear() + '-'
+    + pad(local.getUTCMonth()+1) + '-'
+    + pad(local.getUTCDate()) + 'T'
+    + pad(local.getUTCHours()) + ':'
+    + pad(local.getUTCMinutes()) + ':'
+    + pad(local.getUTCSeconds()) + '.'
+    + String(local.getUTCMilliseconds()).padStart(3, '0')
+    + (isDST ? '+02:00' : '+01:00');
+
+var date = local.getUTCFullYear() + '-'
+    + pad(local.getUTCMonth()+1) + '-'
+    + pad(local.getUTCDate());
+
+// ── Message handling ──────────────────────────────────────────────────────────
+var line = '';
+
+if (msg.payload && msg.payload.dc_amps !== undefined) {
+    // ── Battery message (EMS output 1) ────────────────────────────────────────
+    var p = msg.payload;
+    var i = p.inputs || {};
+    var pl = p.planner || {};
+
+    // Deduplication — only log when state, SoC or amps changes
+    var battKey = (p.charging ? 'CHG' : p.discharging ? 'DCH' : 'IDLE')
+                + '|' + p.dc_amps
+                + '|' + i.batterySoC;
+    var lastBattKey = context.get('lastBattKey') || '';
+    if (battKey === lastBattKey) return null;
+    context.set('lastBattKey', battKey);
+
+    var stateAmps = p.charging ? p.dc_amps + 'A' : p.discharging ? (p.dc_power || 0) + 'W' : '0';
+    line = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+         + isoNow + ' | ' + p.version + ' | ' + LOGGER_VERSION + '\n'
+         + '  STATE:    ' + (p.charging ? 'CHARGING' : p.discharging ? 'DISCHARGING' : 'IDLE')
+         + '  ' + stateAmps + '\n'
+         + '  REASON:   ' + p.reason + '\n'
+         + '  ── Battery ──\n'
+         + '  SoC:      ' + i.batterySoC + '%'
+         + '  |  Solar: ' + (i.solarTotal_W||0).toFixed(0) + 'W'
+         + '  |  netGrid: ' + (i.netGrid_W||0).toFixed(0) + 'W'
+         + '  |  discharge target: ' + (i.dischargeTarget_W||0).toFixed(0) + 'W\n'
+         + '  Price:    ' + (i.currentPrice||0).toFixed(3) + ' EUR'
+         + '  |  avg: ' + (i.avgPrice||0).toFixed(3) + ' EUR'
+         + '  |  ratio: ' + (i.priceRatio||0).toFixed(1) + '%'
+         + '  |  chargeAbsMax: ' + (i.chargeAbsMax||0).toFixed(3) + ' EUR\n'
+         + '  Phases:   L1=' + (i.phaseL1_A||0).toFixed(2) + 'A'
+         + '  L2=' + (i.phaseL2_A||0).toFixed(2) + 'A'
+         + '  L3=' + (i.phaseL3_A||0).toFixed(2) + 'A'
+         + '  |  worstHeadroom: ' + (i.worstHeadroom_A||0).toFixed(2) + 'A'
+         + '  |  maxCharge: ' + (i.maxAllowedCharge_A||0) + 'A\n'
+         + '  EV load:  ' + (i.evCharging_W||0).toFixed(0) + 'W'
+         + '  |  lastEvAmps: ' + (i.evLastAmps||0) + 'A'
+         + '  |  sensorUsed: ' + (i.evSensorUsed||false) + '\n'
+         + '  ── Planner ──\n'
+         + '  inWindow: ' + pl.inWindow
+         + '  |  inDischargeWindow: ' + pl.inDischargeWindow
+         + '  |  cheapestPrice: ' + (pl.cheapestPrice||'?') + ' EUR\n'
+         + '  chargeHours: [' + (pl.plannedHours||[]).join('h, ') + (pl.plannedHours&&pl.plannedHours.length ? 'h' : '') + ']'
+         + '  |  dischargeHours: [' + (pl.plannedDischargeHours||[]).join('h, ') + (pl.plannedDischargeHours&&pl.plannedDischargeHours.length ? 'h' : '') + ']\n'
+         + '  kwhNeeded: ' + (pl.kwhNeeded||0) + ' kWh'
+         + '  |  threshold: ' + (pl.dischargeThreshold||'?') + ' EUR\n';
+
+} else if (msg.payload && msg.payload.targetAmps !== undefined) {
+    // ── EV message (EMS output 2) ─────────────────────────────────────────────
+    var e = msg.payload;
+    var ei = e.inputs || {};
+
+    // Deduplication — only log when state, amps, phase mode or reason changes
+    var evKey = (e.evCharging ? 'ON' : 'OFF')
+              + '|' + e.targetAmps
+              + '|' + (ei.evPhaseMode||'')
+              + '|' + e.reason;
+    var lastEvKey = context.get('lastEvKey') || '';
+    if (evKey === lastEvKey) return null;
+    context.set('lastEvKey', evKey);
+
+    line = '── EV ──────────────────────────────────────────────────────────\n'
+         + isoNow + ' | ' + e.version + ' | ' + LOGGER_VERSION + '\n'
+         + '  STATE:    ' + (e.evCharging ? 'EV ON' : 'EV OFF')
+         + '  ' + e.targetAmps + 'A'
+         + '  [' + (ei.evPhaseMode||'?') + ']\n'
+         + '  REASON:   ' + e.reason + '\n'
+         + '  Car:      ' + (e.carConnected ? 'connected' : 'disconnected')
+         + '  |  zaptecMode: ' + (ei.zaptecMode||'?') + '\n'
+         + '  Phase loads: L1=' + (ei.phaseL1LoadA||0).toFixed(2) + 'A'
+         + '  L2=' + (ei.phaseL2LoadA||0).toFixed(2) + 'A'
+         + '  L3=' + (ei.phaseL3LoadA||0).toFixed(2) + 'A\n'
+         + '  Headroom: L1=' + (ei.l1HeadroomA||0).toFixed(1) + 'A'
+         + '  L2=' + (ei.l2HeadroomA||0).toFixed(1) + 'A'
+         + '  L3=' + (ei.l3HeadroomA||0).toFixed(1) + 'A'
+         + '  |  worst3Phase: ' + (ei.worst3PhaseA||0).toFixed(1) + 'A\n'
+         + '  safeAmps: ' + (ei.evSafeAmps||0) + 'A'
+         + '  |  canCharge: ' + (ei.evCanCharge||false)
+         + '  |  inNight: ' + (ei.evInNight||false)
+         + '  |  inBlackout: ' + (ei.evInBlackout||false) + '\n'
+         + '  L1 safety: hard=' + (ei.l1HardOverload||false)
+         + '  warn=' + (ei.l1WarnOverload||false)
+         + '  count=' + (ei.l1OverloadCount||0)
+         + '  sessionCut=' + (ei.l1SessionCut||false) + '\n'
+         + '  Solar:    export=' + (ei.gridExportW||0) + 'W'
+         + '  surplus=' + (ei.hasSolarSurplus||false)
+         + '  perPhase=' + (ei.solarSurplusPerPhaseA||0) + 'A\n'
+         + '  Price:    ' + (ei.currentPrice||0).toFixed(3) + ' EUR'
+         + '  |  hour: ' + (ei.currentHour||0) + 'h'
+         + '  |  lastEvAmps: ' + (ei.lastEvAmps||0) + 'A\n';
+
+} else {
+    return null;
+}
+
+msg.payload  = line;
+msg.filename = '/share/ems_log_' + date + '.txt';
+return msg;
