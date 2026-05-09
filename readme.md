@@ -1,5 +1,5 @@
 # Battery EMS – Node-RED Setup & Reference Guide
-**EMS v3.27 / Planner v2.14 / EV v1.2** — Updated 5 May 2026
+**EMS v3.45 / Planner v2.14 / EV v2.0** — Updated 9 May 2026
 
 ![Node-red layout](NodeRed.png)
 
@@ -278,19 +278,19 @@ When negative price hours are forecast later today, the planner flags hours befo
 
 ---
 
-## EMS Decision Engine (v3.27) — Configuration Reference
+## EMS Decision Engine (v3.45) — Configuration Reference
 
 ### CFG parameters
 
 | Parameter | Value | Description |
 |---|---|---|
-| `MAX_AMPS` | 200 | Hard cap on DC output amps |
+| `MAX_AMPS` | 100 | Hard cap on DC output amps (safe limit) |
 | `BATTERY_VOLTAGE` | 48 | Nominal DC bus voltage (V) |
 | `BATTERY_KWH` | 40 | Usable capacity (kWh) |
 | `SOC_MIN` | 10% | Discharge floor |
 | `SOC_MAX` | 95% | Hard charge ceiling — no exceptions |
 | `SOC_DISCHARGE_MIN` | 15% | Discharge guard — never discharges below this |
-| `SOC_CRITICAL` | 20% | At or below this, charge at full amps if price is genuinely cheap |
+| `SOC_CRITICAL` | 15% | At or below this, charge at full amps if price is genuinely cheap |
 | `CHARGE_THRESHOLD` | 0.80 | Ratio for price override and fallback charging |
 | `DISCHARGE_THRESHOLD` | 1.20 | Fallback discharge if price ≥ 120% of avg (no planner) |
 | `CHARGE_ABS_RATIO` | 0.55 | `chargeAbsMax` = `avgPrice × 0.55` |
@@ -317,6 +317,7 @@ When negative price hours are forecast later today, the planner flags hours befo
 | `EV_NIGHT_START` | 1 | Night mode start hour (inclusive) |
 | `EV_NIGHT_END` | 6 | Night mode end hour (exclusive) |
 | `EV_RATE_LIMIT_MS` | 900000 | 15 min between Zaptec writes (API recommendation) |
+| `EV_PUBLIC_RATE` | 0.50 | Public charger reference rate (€/kWh) for cost comparison |
 
 ### Decision priority — Battery (highest to lowest)
 
@@ -419,6 +420,21 @@ Sits between EMS output 2 and the Zaptec service nodes. Handles rate limiting so
 
 Outputs 1 and 2 return `null` when rate-limited and state unchanged — Node-RED drops nulls automatically.
 
+### EV session cost tracking (v3.44)
+
+The EV controller tracks charging cost per session and compares to public charger rate:
+
+```
+evSessionKwh     — kWh charged this session (resets on disconnect)
+evSessionCostAct — actual cost at dynamic price (€)
+evSessionCostPub — cost at public rate 0.50 €/kWh (€)
+evSessionSaving  — saving vs public charger (€)
+evInstantCostAct — current cost rate (€/h)
+evInstantCostPub — public rate cost rate (€/h)
+```
+
+The session resets automatically when the car disconnects. Long-term totals are best tracked using Home Assistant's Riemann sum integration on `sensor.sloeierd_laadvermogen`.
+
 ### EV rate limiting
 
 Rate limiting is handled in the **EV Output Router** node (not in the EMS). The router writes to Zaptec when:
@@ -432,7 +448,7 @@ This ensures Zaptec always receives the correct state after a restart, while res
 ```javascript
 {
   payload: {
-    version:      "EV v1.2",
+    version:      "EV v2.0",
     targetAmps:   6.0,
     carConnected: true,
     reason:       "Cheapest hour fallback (0.177 EUR) - EV charging at 6 A (best available)",
@@ -462,8 +478,9 @@ This ensures Zaptec always receives the correct state after a restart, while res
 
 ```javascript
 msg.payload = {
-  version:     "EMS v3.27 / Planner v2.14",
-  dc_amps:     117,
+  version:     "EMS v3.45 / Planner v2.14",
+  dc_amps:     0,        // amps when charging, 0 when discharging
+  dc_power:    5616,    // watts when discharging (117A × 48V), 0 when charging
   charging:    false,
   discharging: true,
   reason:      "High price (128% of avg, 0.261 EUR) - discharging 117 A to cover 4178 W gross import + 800 W export bias",
@@ -554,6 +571,11 @@ msg.payload = {
 | EV load sensor showing 0 when charging | Wrong entity | Check `sensor.sloeierd_laadvermogen` in Developer Tools → States when car is actively charging |
 | `timeSince_s` very large on first run | Context default 0 | Normal on first deploy — resets after first write cycle |
 | Solar surplus charging during discharge window | Old pre-v3.15 script | Update to EMS v3.15+ |
+| Solar surplus not detected while EV charging | Old pre-v3.45 script | EV load clamp hid surplus — update to EMS v3.45+ |
+| Battery charging slowly during cheap window | Old pre-v3.40 script | Solar adjustment was throttling — update to EMS v3.40+ |
+| Battery charging above 100A | Old pre-v3.42 script | MAX_AMPS was 200 — update to EMS v3.42+ |
+| Critical SoC firing at 20% | Old pre-v3.39 script | SOC_CRITICAL was 20% — update to EMS v3.39+ |
+| dc_amps set during discharge | Old pre-v3.43 script | dc_amps/dc_power not split — update to EMS v3.43+ |
 | Discharge window wrong size or hours | Old pre-v2.13 planner | Update to Planner v2.13+ for centered expansion |
 
 ---
@@ -574,6 +596,14 @@ msg.payload = {
 | **EMS v3.18** | 2026-05-03 | EV Charge Controller v1.2 integrated as second output; EV load subtracted from `netGridW` and `dischargeTargetW` so battery never compensates for EV grid draw |
 | **EMS v3.17** | 2026-05-02 | Solar-aware charge rate: grid charge amps reduced proportionally when solar forecast covers part of `kwhNeeded`; floor at 20% of max |
 | **EMS v3.16** | 2026-05-01 | Solar overfill pre-discharge branch added — discharges to `solarPreDischargeTargetSoC` when solar will fill battery before cheap window |
+| **EMS v3.45** | 2026-05-09 | Solar surplus detection uses `rawNetGridW` before EV clamp — fixes surplus not detected when EV charging pushes `netGridW` to 0 |
+| **EMS v3.44** | 2026-05-09 | EV session cost tracking: `evSessionKwh`, `evSessionCostAct`, `evSessionCostPub`, `evSessionSaving`; `EV_PUBLIC_RATE = 0.50` €/kWh reference |
+| **EMS v3.43** | 2026-05-09 | `dc_amps` only set when charging (0 when discharging); `dc_power` only set when discharging (0 when charging) |
+| **EMS v3.42** | 2026-05-09 | `MAX_AMPS` reduced to 100A safe limit |
+| **EMS v3.41** | 2026-05-09 | `MAX_AMPS` reduced to 125A |
+| **EMS v3.40** | 2026-05-09 | Solar-aware charge rate removed from planned cheap window — always charge at full amps when `inChargingWindow=true` |
+| **EMS v3.39** | 2026-05-09 | `SOC_CRITICAL` lowered to 15% (same as `SOC_DISCHARGE_MIN`); critical charge requires `price <= avgPrice × 0.70` |
+| **EV v2.0** | 2026-05-07 | Complete EV rewrite: baseline 6A 24/7; night 00h–06h up to 10A; phase-aware headroom; L1 dual-threshold safety; solar surplus scaling; battery discharge cap; blackout 17h–19h |
 | **EMS v3.15** | 2026-04-28 | Solar surplus charging suppressed during `inDischargeWindow` — discharge takes priority in evening peak |
 | **EMS v3.14** | 2026-04-28 | Min-discharge suppressed when solar surplus > `SOLAR_SUPPRESS_DISCHARGE_W` (500 W) |
 | **EMS v3.13** | 2026-04-26 | `fraction` clamped to [0.10, 1.0] — prevents negative dc_amps; charge window validity gate |
