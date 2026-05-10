@@ -1,4 +1,7 @@
 // EMS Decision Engine
+// v3.60 - battery always charges during cheapest hour regardless of
+//          chargeAbsMax cap; prevents solar surplus branch from taking over
+//          during genuinely cheap price hours
 // v3.59 - night window overrides battery-charging 5A cap; at night both
 //          battery and EV charge together, headroom split between them
 // v3.58 - EV fixed at 5A while home battery is charging; keeps session
@@ -105,7 +108,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.59';
+var EMS_VERSION = 'EMS v3.60';
 var EV_VERSION  = 'EV v2.0';
 
 var CFG = {
@@ -212,6 +215,12 @@ var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESH
 
 var isPriceLow;
 var isPriceVeryLow = priceRatio <= CFG.CHARGE_THRESHOLD && currentPrice <= chargeAbsMax;  // ratio override
+
+// Cheapest hour — always charge when current hour is the cheapest of the day
+var currentHourInt  = new Date().getHours();
+var cheapestHourInt = (msg.cheapestHour !== undefined && msg.cheapestHour !== null) ? parseInt(msg.cheapestHour) : -1;
+var isCheapestHour  = cheapestHourInt >= 0 && currentHourInt === cheapestHourInt && currentPrice <= avgPrice;
+
 var chargeCriticalMax = avgPrice * 0.70;  // more lenient than chargeAbsMax for critical SoC
 if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <= chargeCriticalMax) {
   // Critical SoC — charge if price is reasonably cheap (below avg × 0.70)
@@ -224,7 +233,7 @@ if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <=
   // Planner active — trust the window, but also charge if price is dramatically cheap
   // regardless of whether this hour was planned. Prevents wasting low-price hours
   // that fall outside the centered window (e.g. a cheap morning dip before 12h).
-  isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice;
+  isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice || isCheapestHour;
 }
 
 var isPriceHigh;
