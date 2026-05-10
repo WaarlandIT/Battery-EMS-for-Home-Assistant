@@ -1,4 +1,7 @@
 // EMS Decision Engine
+// v3.58 - EV fixed at 5A while home battery is charging; keeps session
+//          alive below Zaptec 6A threshold, eliminates flapping, battery
+//          gets full grid headroom priority
 // v3.57 - EV overload response changed from 0A (session cut) to 5A;
 //          Zaptec stops charging below 6A but keeps session alive;
 //          session resumes automatically when overload clears
@@ -100,7 +103,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.57';
+var EMS_VERSION = 'EMS v3.58';
 var EV_VERSION  = 'EV v2.0';
 
 var CFG = {
@@ -601,9 +604,10 @@ if (l1SessionCut) {
   if (evInNight) {
     // Night window 23h-06h: up to 10A
     maxAllowed = EV_NIGHT_MAX;
-  } else if (charging && isPriceLow) {
-    // Battery charging at low price — EV gets 7A 3-phase, battery has priority
-    maxAllowed = EV_3PHASE_MIN_A;  // exactly 7A minimum 3-phase
+  } else if (charging) {
+    // Battery is charging — EV fixed at 5A (session alive, below 6A threshold)
+    // Battery gets full grid headroom priority, no EV flapping
+    maxAllowed = 5;  // below Zaptec 6A min → pauses charging but keeps session
   } else if (!charging && (isPriceVeryLow || (inChargingWindow && currentPrice <= chargeAbsMax))) {
     // Battery full/idle at cheapest price — EV can use more
     maxAllowed = EV_NIGHT_MAX;  // up to 10A
@@ -615,12 +619,11 @@ if (l1SessionCut) {
   }
   var candidate3 = Math.min(maxAllowed, Math.floor(worst3PhaseA));
   if (candidate3 >= EV_3PHASE_MIN_A) {
-    // Enough for 3-phase
     evSafeAmps  = candidate3;
     evPhaseMode = '3-phase';
   } else {
-    // Headroom allows 3-phase but target is below 7A threshold — use L1 at 6A baseline
-    evSafeAmps  = EV_MIN_AMPS;
+    // Target below 7A threshold — single phase
+    evSafeAmps  = charging ? 5 : EV_MIN_AMPS;  // 5A when battery charging, 6A otherwise
     evPhaseMode = 'single-phase-L1';
   }
   // Enforce night minimum: at least 8A if night and can charge
