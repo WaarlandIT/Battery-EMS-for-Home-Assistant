@@ -1,4 +1,23 @@
 // EMS Decision Engine
+// v3.57 - EV overload response changed from 0A (session cut) to 5A;
+//          Zaptec stops charging below 6A but keeps session alive;
+//          session resumes automatically when overload clears
+// v3.56 - forced idle cycle between charging and discharging transitions;
+//          prevents direct charge→discharge or discharge→charge without idle
+// v3.55 - EV daytime charging rules:
+//          battery charging + price low → EV 7A 3-phase (battery has lead)
+//          battery full + cheapest price → EV up to 10A 3-phase
+//          battery full + solar surplus → EV scales to surplus
+//          baseline → 6A L1
+// v3.54 - battery discharge target corrected for EV phase contribution;
+//          only covers home load above EV baseline; EV phase mode hysteresis
+//          prevents flapping between 3-phase and single-phase at night
+// v3.49 - EXPORT_BIAS_W suppressed when solar > 500W to prevent discharge
+//          oscillation caused by bias overshooting into export during solar hours
+// v3.48 - when solar is exporting during discharge window, throttle discharge
+//          to cover only home load (not export); use per-phase import sum as
+//          target instead of cutting discharge completely
+// v3.47 - EV night window extended to 23h-06h (was 00h-06h)
 // v3.45 - actualSurplusW calculated from raw netGrid before clamp;
 //          fixes solar surplus not detected when EV load subtraction pushes
 //          netGridW to 0 even though grid is exporting
@@ -81,7 +100,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.45';
+var EMS_VERSION = 'EMS v3.57';
 var EV_VERSION  = 'EV v2.0';
 
 var CFG = {
@@ -134,7 +153,18 @@ var evChargingW   = (msg.EVChargeLoad !== undefined && msg.EVChargeLoad !== null
 
 var rawNetGridW      = (gridImport - gridExport) * 1000 - evChargingW;
 var netGridW         = Math.max(0, rawNetGridW);
-var dischargeTargetW = Math.max(0, gridImport * 1000 - evChargingW);
+
+// Discharge target: cover only home load, not EV load.
+// When EV is on 3-phase, each phase carries evLastAmps of EV load.
+// Subtract EV phase contribution from each phase to get true home load.
+var evPhaseContrib   = (lastEvAmps >= 7) ? lastEvAmps : 0;  // 3-phase EV contribution per phase
+var homeL1W          = Math.max(0, phaseL1A - evPhaseContrib) * CFG.GRID_VOLTAGE;
+var homeL2W          = Math.max(0, phaseL2A - evPhaseContrib) * CFG.GRID_VOLTAGE;
+var homeL3W          = Math.max(0, phaseL3A - evPhaseContrib) * CFG.GRID_VOLTAGE;
+var homeImportW      = homeL1W + homeL2W + homeL3W;
+var dischargeTargetW = evChargingW > 0
+  ? Math.max(0, homeImportW)                          // EV charging: cover home load only
+  : Math.max(0, gridImport * 1000 - evChargingW);     // no EV: use total grid import
 
 var phaseL1kW  = parseFloat(msg.phaseL1)   || 0;
 var phaseL2kW  = parseFloat(msg.phaseL2)   || 0;
@@ -313,7 +343,10 @@ if (isNegPrice && canCharge) {
 
 } else if (isPriceHigh && canDischarge) {
   if (dischargeTargetW > 0) {
-    var targetW = dischargeTargetW + CFG.EXPORT_BIAS_W;
+    // Suppress export bias when solar is producing — prevents oscillation
+    // where bias pushes into export → idle → import → discharge → repeat
+    var exportBias = solarTotalW > 500 ? 0 : CFG.EXPORT_BIAS_W;
+    var targetW = dischargeTargetW + exportBias;
     // FIX 2: removed / CFG.ROUND_TRIP_EFF — efficiency applies to charging only.
     //         discharge amps = DC watts needed ÷ DC bus voltage, then overshoot for lag.
     //         old formula inflated amps by factor of (OVERSHOOT / EFF) = 1.25/0.85 = ~1.47×
@@ -322,17 +355,31 @@ if (isNegPrice && canCharge) {
     var clampedAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, neededAmps));
     discharging = true;
     targetAmps  = clampedAmps;
-    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import + ' + CFG.EXPORT_BIAS_W + ' W export bias' + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
-  } else if (actualSurplusW < CFG.SOLAR_SUPPRESS_DISCHARGE_W) {
-    // Only export from battery when solar is not already covering export.
-    // If solar surplus is large, preserve battery charge for the planned window.
+    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import' + (exportBias > 0 ? ' + ' + exportBias + ' W export bias' : ' (no bias, solar active)') + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
+  } else if (actualSurplusW > 0) {
+    // Solar is exporting — throttle discharge to cover only home load.
+    // Target = per-phase import sum (W actually being imported from grid).
+    // If all phases are exporting, dischargeTargetW = 0 and we stay idle.
+    // Otherwise discharge just enough to bring the importing phases to 0.
+    var importOnlyW = Math.max(0, gridImport * 1000 - evChargingW);
+    if (importOnlyW > 0) {
+      // Some phases still importing — cover just that, no export bias
+      var throttleAmps = Math.round((importOnlyW / CFG.BATTERY_VOLTAGE) * CFG.DISCHARGE_OVERSHOOT);
+      throttleAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, throttleAmps));
+      discharging = true;
+      targetAmps  = throttleAmps;
+      reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - throttled discharge ' + targetAmps + ' A (solar exporting ' + actualSurplusW.toFixed(0) + ' W, covering ' + importOnlyW.toFixed(0) + ' W import only)';
+    } else {
+      // All phases exporting — solar covers everything, battery idle
+      discharging = false;
+      targetAmps  = 0;
+      reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - solar covers all load (' + actualSurplusW.toFixed(0) + ' W surplus), battery idle';
+    }
+  } else {
+    // No surplus — export min discharge at peak price
     discharging = true;
     targetAmps  = CFG.MIN_DISCHARGE_A;
-    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price (solar export: ' + actualSurplusW.toFixed(0) + ' W)';
-  } else {
-    discharging = false;
-    targetAmps  = 0;
-    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - solar exporting ' + actualSurplusW.toFixed(0) + ' W, battery idle (surplus > ' + CFG.SOLAR_SUPPRESS_DISCHARGE_W + ' W threshold)';
+    reason      = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - exporting ' + CFG.MIN_DISCHARGE_A + ' A to grid at peak price';
   }
 
 } else {
@@ -351,6 +398,18 @@ if (targetAmps === 0) {
 context.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');
 
 var rawState = charging ? 'charging' : discharging ? 'discharging' : 'idle';
+
+// Force idle cycle between charge and discharge transitions
+// Prevents inverter stress from direct polarity reversal
+if (rawState === 'discharging' && lastState === 'charging') {
+  rawState = 'idle';
+  reason += ' [forced idle: charge → idle → discharge]';
+}
+if (rawState === 'charging' && lastState === 'discharging') {
+  rawState = 'idle';
+  reason += ' [forced idle: discharge → idle → charge]';
+}
+
 var confirmedState;
 if (rawState === pendingState) {
   var newCount = pendingCount + 1;
@@ -449,10 +508,11 @@ var currentHour = new Date().getHours();
 // ── Time windows ─────────────────────────────────────────────────────────────
 var EV_BLACKOUT_START = 17;
 var EV_BLACKOUT_END   = 19;
-var EV_NIGHT_START    = 0;   // midnight
-var EV_NIGHT_END      = 6;
+var EV_NIGHT_START    = 23;  // 23h — crosses midnight
+var EV_NIGHT_END      = 6;   // 06h
 var evInBlackout = currentHour >= EV_BLACKOUT_START && currentHour < EV_BLACKOUT_END;
-var evInNight    = currentHour >= EV_NIGHT_START && currentHour < EV_NIGHT_END;
+// Night window crosses midnight: 23h-06h
+var evInNight    = currentHour >= EV_NIGHT_START || currentHour < EV_NIGHT_END;
 
 // ── Phase loads (true values — add back EV's own current share) ───────────────
 var evCurrentPerPhase = lastEvAmps;  // 3-phase balanced → per-phase amps = commanded
@@ -503,30 +563,55 @@ var EV_3PHASE_MIN_A  = 7;   // 3-phase kicks in at this threshold
 var EV_NIGHT_MAX     = 10;  // max amps during night window
 var EV_NIGHT_MIN     = 8;   // minimum amps during night window
 
+// ── Phase mode hysteresis ────────────────────────────────────────────────────
+// Prevent flapping between 3-phase and single-phase at night.
+// Only drop to single-phase after EV_PHASE_DROP_CYCLES consecutive cycles below threshold.
+// Switch back to 3-phase immediately when headroom recovers.
+var EV_PHASE_DROP_CYCLES = 3;
+var phaseDropCount = context.get('phaseDropCount') || 0;
+if (worst3PhaseA < EV_3PHASE_MIN_A) {
+    phaseDropCount = Math.min(phaseDropCount + 1, EV_PHASE_DROP_CYCLES + 1);
+} else {
+    phaseDropCount = 0;  // reset immediately when headroom recovers
+}
+context.set('phaseDropCount', phaseDropCount);
+// Allow 3-phase if headroom is sufficient OR we haven't hit the drop threshold yet
+var allow3Phase = (worst3PhaseA >= EV_3PHASE_MIN_A) || (phaseDropCount < EV_PHASE_DROP_CYCLES);
+
 var evSafeAmps;
 var evPhaseMode;
 var evCanCharge;
 
 if (l1SessionCut) {
-  // L1 persistently or acutely overloaded — end session
-  evSafeAmps  = 0;
-  evPhaseMode = 'paused-L1-overload';
-  evCanCharge = false;
+  // L1 overloaded — drop to 5A (below Zaptec 6A minimum so charging pauses
+  // but session stays alive; resumes automatically when overload clears)
+  evSafeAmps  = 5;
+  evPhaseMode = 'single-phase-L1';
+  evCanCharge = true;
 
-} else if (worst3PhaseA >= EV_3PHASE_MIN_A) {
+} else if (allow3Phase) {
   // All 3 phases have headroom for 3-phase charging
-  // During night: max EV_NIGHT_MAX amps
-  // During day with solar surplus: scale to surplus (keep grid at 0)
-  // Otherwise: baseline EV_MIN_AMPS
+  // EV daytime charging rules:
+  //   Night 23h-06h:                up to 10A
+  //   Battery charging + price low: 7A (battery has lead, EV gets minimum 3-phase)
+  //   Battery full + cheapest price: up to 10A
+  //   Solar surplus:                scale to surplus
+  //   Baseline:                     6A L1 (handled by else branch below)
   var maxAllowed;
   if (evInNight) {
+    // Night window 23h-06h: up to 10A
     maxAllowed = EV_NIGHT_MAX;
-    // Night minimum is 8A — override lower values
+  } else if (charging && isPriceLow) {
+    // Battery charging at low price — EV gets 7A 3-phase, battery has priority
+    maxAllowed = EV_3PHASE_MIN_A;  // exactly 7A minimum 3-phase
+  } else if (!charging && (isPriceVeryLow || (inChargingWindow && currentPrice <= chargeAbsMax))) {
+    // Battery full/idle at cheapest price — EV can use more
+    maxAllowed = EV_NIGHT_MAX;  // up to 10A
   } else if (hasSolarSurplus && solarSurplusPerPhaseA >= EV_3PHASE_MIN_A) {
-    // Size to solar surplus — add current EV amps back since they're already in export calc
+    // Solar surplus — scale EV to surplus
     maxAllowed = Math.min(16, solarSurplusPerPhaseA + evCurrentPerPhase);
   } else {
-    maxAllowed = EV_MIN_AMPS;
+    maxAllowed = EV_MIN_AMPS;  // daytime baseline → falls to L1 6A via candidate3 check
   }
   var candidate3 = Math.min(maxAllowed, Math.floor(worst3PhaseA));
   if (candidate3 >= EV_3PHASE_MIN_A) {
@@ -546,7 +631,7 @@ if (l1SessionCut) {
   evCanCharge = true;
 
 } else {
-  // Not enough headroom for 3-phase — use L1 single phase
+  // Not enough headroom for 3-phase AND hysteresis threshold reached — use L1
   // Solar surplus on L1: scale up if surplus allows, otherwise baseline 6A
   if (hasSolarSurplus && solarSurplusL1A + evCurrentPerPhase > EV_MIN_AMPS && !evInNight) {
     // Size to L1 surplus but stay below 7A (above 7 would trigger 3-phase)
@@ -583,11 +668,12 @@ if (!evCarConnected) {
   evTargetAmps = 0;
   evReason     = 'Car not connected (' + (zaptecMode || 'unknown') + ')';
 
-} else if (!evCanCharge) {
-  // L1 overloaded — cut session
-  evTargetAmps = 0;
+} else if (l1SessionCut) {
+  // L1 overloaded — drop to 5A to pause charging without ending session
+  evTargetAmps = 5;
+  evPhaseMode  = 'single-phase-L1';
   evReason     = (l1HardOverload ? 'L1 instant overload' : 'L1 persistent overload')
-               + ' (' + phaseL1LoadA.toFixed(1) + ' A) — session cut to protect fuse';
+               + ' (' + phaseL1LoadA.toFixed(1) + ' A) — reduced to 5A, session kept alive';
 
 } else if (evInBlackout) {
   // Blackout window — but still send minimum 6A to keep session alive
@@ -712,6 +798,8 @@ var evMsg = {
       l1WarnOverload:   l1WarnOverload,
       l1OverloadCount:  l1OverloadCount,
       l1SessionCut:     l1SessionCut,
+      phaseDropCount:  phaseDropCount,
+      allow3Phase:     allow3Phase,
       gridExportW:      parseFloat(gridExportW.toFixed(0)),
       solarSurplusPerPhaseA: solarSurplusPerPhaseA,
       hasSolarSurplus:  hasSolarSurplus,
