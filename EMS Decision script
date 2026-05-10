@@ -1,4 +1,6 @@
 // EMS Decision Engine
+// v3.59 - night window overrides battery-charging 5A cap; at night both
+//          battery and EV charge together, headroom split between them
 // v3.58 - EV fixed at 5A while home battery is charging; keeps session
 //          alive below Zaptec 6A threshold, eliminates flapping, battery
 //          gets full grid headroom priority
@@ -103,7 +105,7 @@
 // v3.1 - SOC_DISCHARGE_MIN 15%, SOC_CRITICAL 20%
 // v3.0 - P1 phase readings used directly
 
-var EMS_VERSION = 'EMS v3.58';
+var EMS_VERSION = 'EMS v3.59';
 var EV_VERSION  = 'EV v2.0';
 
 var CFG = {
@@ -604,10 +606,12 @@ if (l1SessionCut) {
   if (evInNight) {
     // Night window 23h-06h: up to 10A
     maxAllowed = EV_NIGHT_MAX;
-  } else if (charging) {
-    // Battery is charging — EV fixed at 5A (session alive, below 6A threshold)
-    // Battery gets full grid headroom priority, no EV flapping
-    maxAllowed = 5;  // below Zaptec 6A min → pauses charging but keeps session
+  } else if (charging && !evInNight) {
+    // Battery is charging (daytime) — EV fixed at 5A, battery has priority
+    maxAllowed = 5;
+  } else if (charging && evInNight) {
+    // Night: both charge together — split headroom, EV gets up to night max
+    maxAllowed = EV_NIGHT_MAX;
   } else if (!charging && (isPriceVeryLow || (inChargingWindow && currentPrice <= chargeAbsMax))) {
     // Battery full/idle at cheapest price — EV can use more
     maxAllowed = EV_NIGHT_MAX;  // up to 10A
@@ -623,7 +627,7 @@ if (l1SessionCut) {
     evPhaseMode = '3-phase';
   } else {
     // Target below 7A threshold — single phase
-    evSafeAmps  = charging ? 5 : EV_MIN_AMPS;  // 5A when battery charging, 6A otherwise
+    evSafeAmps  = (charging && !evInNight) ? 5 : EV_MIN_AMPS;  // 5A daytime charging, 6A night/idle
     evPhaseMode = 'single-phase-L1';
   }
   // Enforce night minimum: at least 8A if night and can charge
