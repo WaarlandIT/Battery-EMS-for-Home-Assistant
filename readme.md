@@ -1,7 +1,8 @@
 # Battery EMS – Node-RED Setup & Reference Guide
-**EMS v3.45 / Planner v2.14 / EV v2.0** — Updated 9 May 2026
 
-![Node-red layout](NodeRed.png)
+**EMS v3.71 / Planner v2.14 / EV v2.2** — Updated 14 May 2026
+
+[![Node-red layout](https://github.com/WaarlandIT/Battery-EMS-for-Home-Assistant/raw/main/NodeRed.png)](NodeRed.png)
 
 ---
 
@@ -18,6 +19,7 @@ This flow was built around a **Growatt inverter** for the solar array and a **De
 ## Prerequisites
 
 Install in Node-RED via **Manage palette**:
+
 - `node-red-contrib-home-assistant-websocket` — all Home Assistant nodes
 
 ---
@@ -27,7 +29,7 @@ Install in Node-RED via **Manage palette**:
 All integrations must be installed and working before the EMS flow can function.
 
 | Integration | Source | Purpose in EMS |
-|---|---|---|
+| --- | --- | --- |
 | **Frank Energie** | [github.com/HiDiHo01/home-assistant-frank_energie](https://github.com/HiDiHo01/home-assistant-frank_energie) | Hourly dynamic electricity prices — primary price source for planner and EMS |
 | **DSMR Smart Meter** | [home-assistant.io/integrations/dsmr](https://www.home-assistant.io/integrations/dsmr/) | Real-time grid import/export (kW) and per-phase load (kW) via P1 port |
 | **Growatt ESPHome** | [github.com/WaarlandIT/ESPHOME-Growatt](https://github.com/WaarlandIT/ESPHOME-Growatt) | Live solar AC output per phase (PAC1/2/3 in W) |
@@ -45,7 +47,7 @@ All integrations must be installed and working before the EMS flow can function.
 Create these in **Settings → Devices & Services → Helpers** before importing the flow:
 
 | Type | Entity ID | Min | Max | Step |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `input_number` | `input_number.battery_dc_amps` | 0 | 200 | 1 |
 | `input_boolean` | `input_boolean.battery_charging` | — | — | — |
 | `input_boolean` | `input_boolean.battery_discharging` | — | — | — |
@@ -59,15 +61,17 @@ These are the three outputs the EMS writes every cycle. Your battery inverter in
 Verify these in the relevant `api-current-state` nodes after importing. Use **Developer Tools → States** to find your exact entity names.
 
 ### Frank Energie (price source) — [GitHub](https://github.com/HiDiHo01/home-assistant-frank_energie)
+
 | Node | Entity ID | Output |
-|---|---|---|
+| --- | --- | --- |
 | Frank Energie prijzen | `sensor.frank_energie_prijzen_huidige_elektriciteitsprijs_all_in` | `msg.frankPrices` (attributes.prices array) |
 
-> The planner calculates `currentPrice` and `avgPrice` directly from this array, overriding anything from EnergyZero sensors.
+> The planner calculates `currentPrice` and `avgPrice` directly from this array, overriding anything from EnergyZero.
 
 ### DSMR Smart Meter — [HA Docs](https://www.home-assistant.io/integrations/dsmr/)
+
 | Node | Entity ID | Output |
-|---|---|---|
+| --- | --- | --- |
 | Grid import kW | `sensor.dsmr_reading_electricity_currently_delivered` | `msg.gridImport` (kW) |
 | Grid export kW | `sensor.dsmr_reading_electricity_currently_returned` | `msg.gridExport` (kW) |
 | Phase L1 kW | `sensor.dsmr_reading_phase_currently_delivered_l1` | `msg.phaseL1` |
@@ -75,10 +79,13 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
 | Phase L3 kW | `sensor.dsmr_reading_phase_currently_delivered_l3` | `msg.phaseL3` |
 
 > Entity names vary by DSMR version. Search `dsmr` in Developer Tools → States to confirm yours.
+>
+> **Important:** The DSMR P1 port reads the main grid meter, which includes **all** loads — house, EV charger, and everything else. The EMS uses these values directly as ground truth. Do not add or subtract EV amps from DSMR phase readings; they already reflect what is actually on the wire.
 
 ### Growatt Solar (AC output per phase) — [GitHub](https://github.com/WaarlandIT/ESPHOME-Growatt)
+
 | Node | Entity ID | Output |
-|---|---|---|
+| --- | --- | --- |
 | Solar PAC1 W | `sensor.growatt_pac1` | `msg.pac1` |
 | Solar PAC2 W | `sensor.growatt_pac2` | `msg.pac2` |
 | Solar PAC3 W | `sensor.growatt_pac3` | `msg.pac3` |
@@ -86,33 +93,37 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
 > AC watts per phase summed as `solarTotalW = pac1 + pac2 + pac3`.
 
 ### Forecast.Solar — [HA Docs](https://www.home-assistant.io/integrations/forecast_solar/)
+
 | Node | Entity ID | Output |
-|---|---|---|
+| --- | --- | --- |
 | Solar forecast remaining | `sensor.energy_production_remaining_today` | `msg.solarForecastRemaining` (kWh) |
 
 > The planner deducts this from `kwhNeeded` to reduce grid charge hours when solar will cover part of the charge. Also used to detect when solar will fill the battery before the cheap window opens. Falls back safely to 0 if unavailable.
 
 ### Battery SoC — [ha-solarman GitHub](https://github.com/davidrapan/ha-solarman)
+
 | Node | Entity ID | Output |
-|---|---|---|
+| --- | --- | --- |
 | Battery SoC | `sensor.battery_state_of_charge` | `msg.batterySoC` (%) |
 
 > Replace with your actual BMS/inverter SoC entity. For the StephanJoubert solarman integration use `sensor.deye_battery_soc`.
 
 ### Zaptec EV Charger — [GitHub](https://github.com/custom-components/zaptec)
+
 | Node | Entity ID | Output / Action |
-|---|---|---|
+| --- | --- | --- |
 | Get Zaptec mode | `sensor.sloeierd_charger_mode` | `msg.zaptecMode` (str) |
 | Get EV charge load | `sensor.sloeierd_laadvermogen` | `msg.EVChargeLoad` (W, total 3-phase) |
 | Set Zaptec current | `number.sloeierd_max_stroom` | Sets charge current per phase (6–10 A) |
 | Set Zaptec switch on | `switch.sloeierd_opladen` | `switch.turn_on` — starts charging session |
 | Set Zaptec switch off | `switch.sloeierd_opladen` | `switch.turn_off` — stops charging session |
 
-> Replace `sloeierd` with your charger's entity prefix. Find it by searching `zaptec` in Developer Tools → States. `sensor.sloeierd_laadvermogen` reports total 3-phase power in watts — used to accurately subtract EV load from grid import. The minimum charge current for Zaptec is 6A; setting to 0 does not pause — use the switch instead.
+> Replace `sloeierd` with your charger's entity prefix. Find it by searching `zaptec` in Developer Tools → States. `sensor.sloeierd_laadvermogen` reports total 3-phase power in watts — used to subtract EV load from `netGridW` so the battery does not compensate for intentional EV consumption. The minimum charge current for Zaptec is 6A; setting 5A keeps the session alive but pauses actual charging. Setting 0A does not pause — use the switch instead.
 
 ### Trigger nodes — [EnergyZero HA Docs](https://www.home-assistant.io/integrations/energyzero/)
+
 | Node | Entity ID | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | DSMR power change | `sensor.electricity_meter_energieverbruik` | Fire instantly on load change |
 | Price hour change | `sensor.energyzero_today_energy_current_hour_price` | Fire on hourly price rollover |
 
@@ -137,21 +148,23 @@ Verify these in the relevant `api-current-state` nodes after importing. Use **De
                                                                                                            [Get Zaptec mode]
                                                                                                          [EMS Decision Engine]
                                                                                                           (outputs: 2)
-                                                                              ┌──────────────────────────────────┘ └────────────────────┐
-                                                                    [Split outputs]                                          [Set Zaptec current]
-                                                        ┌───────────────┬───────────┐                                        [EV Diagnostics]
-                                                [Set dc_amps] [Set charging] [Set discharging]
-                                                                    [EMS Diagnostics]
+                                                              ┌──────────────────────────────────────────────┘ └────────────────────┐
+                                                    [Split outputs]                                                      [EV Output Router]
+                                                ┌───────────────┬───────────┐                               ┌────────────────┬────────────────┐
+                                        [Set dc_amps] [Set charging] [Set discharging]            [Zaptec switch]  [Set Zaptec A]  [EV Diagnostics]
+                                                            [EMS Diagnostics]
 ```
 
 **Important:** The EMS Decision Engine function node must be configured with **2 outputs** in Node-RED. Output 1 carries the battery message to `Split outputs`. Output 2 carries the EV message to the **EV Output Router** function node.
 
 The EV Output Router (3 outputs) handles rate limiting and splits the EV message into:
+
 - Output 1 → Switch node → `Turn ON` / `Turn OFF` (`switch.sloeierd_opladen`)
-- Output 2 → `Set Zaptec current` (`number.sloeierd_max_stroom`, data `{"value": {{zaptecValue}}}`)
+- Output 2 → `Set Zaptec current` — only fires when `evCharging = true`; uses `msg.zaptecValue` (float)
 - Output 3 → `EV Diagnostics` debug node
 
 ### Set solarNow function node
+
 Add a small function node between Solar PAC3 and Price Planner to pass current solar production to the planner for overfill detection:
 
 ```javascript
@@ -162,7 +175,9 @@ return msg;
 ```
 
 ### Get EV charge load node
+
 Add an `api-current-state` node between Solar PAC3 and `Get Zaptec mode` to read actual EV power consumption:
+
 - Entity: `sensor.sloeierd_laadvermogen`
 - Output property: `msg.EVChargeLoad` (num)
 
@@ -173,12 +188,13 @@ This gives the EMS the actual measured 3-phase EV load in watts, which is subtra
 ## Step 4 – Trigger Configuration
 
 | Trigger | Interval | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | Every 5 min inject | 300 s | Baseline heartbeat |
 | DSMR power change | Every DSMR update (~2–10 s) | React instantly to home load changes |
 | Price hour change | Every hour | React immediately when price rolls to next hour |
 
 In both `server-state-changed` nodes, ensure:
+
 - **Only send if state changes** — enabled
 - **Ignore unavailable/unknown** — enabled on both incoming and outgoing state
 
@@ -187,16 +203,15 @@ In both `server-state-changed` nodes, ensure:
 ## Step 5 – Battery Specs (verify in both scripts)
 
 | Spec | Value | Config key |
-|---|---|---|
+| --- | --- | --- |
 | Capacity | 40 kWh | `BATTERY_KWH` |
 | Voltage | 48 V DC | `BATTERY_VOLTAGE` |
-| Max charge/discharge | 200 A | `MAX_AMPS` |
-| Max charge power | ~8.16 kW (200 A × 48 V × 0.85) | derived |
-| Max discharge power | 9.6 kW (200 A × 48 V / 1000) | `MAX_DISCHARGE_KW` |
+| Max charge/discharge | 100 A | `MAX_AMPS` |
+| Max charge power | ~4.08 kW (100 A × 48 V × 0.85) | derived |
+| Max discharge power | 4.8 kW (100 A × 48 V / 1000) | derived |
 | Round-trip efficiency | 85% | `ROUND_TRIP_EFF` |
 | Usable discharge capacity | 32 kWh (SoC 95% → 15%) | derived |
-| Full charge time (from SOC_MIN) | ~4.2 h at max rate | derived |
-| Grid connection | 3-phase, 20 A fuse | `GRID_MAX_A_PHASE` = 18 (2 A margin) |
+| Grid connection | 3-phase, 20 A fuse per phase | `EV_L1_HARD_LIMIT` = 20 |
 
 ---
 
@@ -205,6 +220,7 @@ In both `server-state-changed` nodes, ensure:
 The planner runs first each cycle and calculates today's optimal charge and discharge schedule before any sensor data is read.
 
 ### Price source
+
 Prices are read from the Frank Energie `attributes.prices` array. `currentPrice` and `avgPrice` are calculated from this array and written to `msg`, overriding anything from EnergyZero.
 
 ### kWh needed and solar deduction
@@ -217,11 +233,12 @@ solarUsable    = solarForecastRemaining × 0.90
 ```
 
 Solar is split into before and after the cheap window using current production rate:
+
 ```
 solarBeforeCheapWindow = solarNow_kW × hoursUntilCheapWindow
 solarAfterCheapWindow  = max(0, solarUsable − solarBeforeCheapWindow)
 kwhFromGrid    = max(0, kwhNeeded − solarAfterCheapWindow)
-hoursNeeded    = ceil(kwhFromGrid / 8.16 kW) + 1 safety hour
+hoursNeeded    = ceil(kwhFromGrid / 4.08 kW) + 1 safety hour
 ```
 
 Only solar arriving **after** the cheap window offsets grid charging — solar before the window fills the battery independently.
@@ -258,7 +275,7 @@ When negative price hours are forecast later today, the planner flags hours befo
 ### Planner config constants
 
 | Constant | Value | Description |
-|---|---|---|
+| --- | --- | --- |
 | `BATTERY_KWH` | 40 | Battery capacity |
 | `SOC_MIN` | 10% | Minimum SoC floor |
 | `SOC_MAX` | 95% | Maximum SoC ceiling |
@@ -278,12 +295,12 @@ When negative price hours are forecast later today, the planner flags hours befo
 
 ---
 
-## EMS Decision Engine (v3.45) — Configuration Reference
+## EMS Decision Engine (v3.71) — Configuration Reference
 
 ### CFG parameters
 
 | Parameter | Value | Description |
-|---|---|---|
+| --- | --- | --- |
 | `MAX_AMPS` | 100 | Hard cap on DC output amps (safe limit) |
 | `BATTERY_VOLTAGE` | 48 | Nominal DC bus voltage (V) |
 | `BATTERY_KWH` | 40 | Usable capacity (kWh) |
@@ -302,22 +319,30 @@ When negative price hours are forecast later today, the planner flags hours befo
 | `SOLAR_SURPLUS_EXIT_W` | 200 | Min solar export surplus (W) to keep solar charging |
 | `SOLAR_SUPPRESS_DISCHARGE_W` | 500 | Suppress min-discharge when solar surplus exceeds this |
 | `ROUND_TRIP_EFF` | 0.85 | Charging efficiency — charge amps only, NOT discharge |
-| `GRID_MAX_A_PHASE` | 18 | Usable amps per phase (20 A fuse − 2 A margin) |
+| `GRID_MAX_A_PHASE` | 18 | Usable amps per phase for battery headroom calculation (20 A fuse − 2 A margin) |
 | `GRID_VOLTAGE` | 230 | AC grid voltage |
-| `SAFETY_MARGIN_A` | 2 | Per-phase headroom buffer |
+| `SAFETY_MARGIN_A` | 2 | Per-phase headroom buffer for battery charge calc |
 | `MIN_DISCHARGE_A` | 35 | Minimum meaningful discharge current (A) |
 | `MIN_CHARGE_A` | 10 | Minimum charge current — floor for negative price spread |
-| `EV_MAX_AMPS` | 6 | Maximum EV charge current per phase during daytime (A) |
-| `EV_NIGHT_AMPS` | 8 | Mandatory night charge current per phase 01h–06h (A) |
-| `EV_NIGHT_MAX_AMPS` | 10 | Maximum EV current per phase during night when headroom allows (A) |
-| `EV_SOLAR_MIN_W` | 4200 | Min solar surplus to start EV charging (6A × 230V × 3 phases) |
-| `EV_SOLAR_EXIT_W` | 2400 | Min solar surplus to keep EV charging (3-phase) |
+| `EV_PUBLIC_RATE` | 0.50 | Public charger reference rate (€/kWh) for cost comparison |
+
+### EV constants (in EV Charge Controller section)
+
+| Constant | Value | Description |
+| --- | --- | --- |
+| `EV_MIN_AMPS` | 6 | Absolute minimum EV charge current — never goes lower unless 6A itself still causes overload |
+| `EV_NIGHT_MAX` | 10 | Maximum EV current during night window (23h–06h) |
+| `EV_NIGHT_MIN` | 8 | Minimum EV current during night window |
+| `EV_L1_HARD_LIMIT` | 20 | Per-phase hard limit (A) — actual fuse rating |
+| `EV_L1_WARN_LIMIT` | 18 | Per-phase warn threshold (A) — diagnostic only in v2.2 |
+| `EV_CUT_COOLDOWN_POLLS` | 10 | Polls to hold at 6A after a session cut before attempting ramp |
+| `EV_RAMP_UP_POLLS` | 4 | Consecutive clear polls needed to add 1A during ramp-up |
+| `EV_3PHASE_MIN_A` | 7 | Threshold above which Zaptec uses 3-phase (Zaptec behavior) |
 | `EV_BLACKOUT_START` | 17 | EV charging blackout start hour (inclusive) |
 | `EV_BLACKOUT_END` | 19 | EV charging blackout end hour (exclusive) |
-| `EV_NIGHT_START` | 1 | Night mode start hour (inclusive) |
-| `EV_NIGHT_END` | 6 | Night mode end hour (exclusive) |
+| `EV_NIGHT_START` | 23 | Night window start hour (crosses midnight) |
+| `EV_NIGHT_END` | 6 | Night window end hour |
 | `EV_RATE_LIMIT_MS` | 900000 | 15 min between Zaptec writes (API recommendation) |
-| `EV_PUBLIC_RATE` | 0.50 | Public charger reference rate (€/kWh) for cost comparison |
 
 ### Decision priority — Battery (highest to lowest)
 
@@ -327,102 +352,90 @@ When negative price hours are forecast later today, the planner flags hours befo
 
 2. isPriceLow AND canCharge              → charge at scaled amps
      a) SoC <= SOC_CRITICAL AND cheap    → full amps, critical recovery
-     b) inChargingWindow = true          → solar-adjusted scaled amps
+     b) inChargingWindow = true          → scaled amps
      c) isPriceVeryLow (ratio ≤ 0.80     → scaled amps, outside planned window
         AND price ≤ avgPrice × 0.55)
 
 3. Solar surplus AND NOT inDischargeWindow → absorb surplus (skipped during discharge window)
 
 4. inSolarPreDischargeWindow             → pre-discharge before solar overfills battery
-                                           (creates room for cheap grid charging)
 
 5. inPreDischargeWindow                  → pre-discharge before negative price window
 
 6. isPriceHigh AND canDischarge
      a) dischargeTarget > 0             → cover gross import + export bias
-     b) dischargeTarget = 0 AND         → export at MIN_DISCHARGE_A
-        surplus < SOLAR_SUPPRESS_W        (suppressed if solar already exporting)
+     b) dischargeTarget = 0 AND solar   → cover remaining import only (throttled)
+     c) no surplus                      → export at MIN_DISCHARGE_A
 
 7. Idle
 ```
 
-### EV load subtraction (v3.18)
+### EV load subtraction
 
-When the EV is charging from grid, the DSMR meter reports that as home import. Without correction the battery would discharge to compensate for the intentional EV load. The EMS subtracts EV charging power from both `netGridW` and `dischargeTargetW` each cycle:
+The DSMR P1 meter reports total grid load including the EV. The EMS subtracts measured EV charging power from `netGridW` and `dischargeTargetW` each cycle so the battery never discharges to compensate for intentional EV consumption:
 
 ```javascript
-evChargingW      = lastEvAmps × GRID_VOLTAGE        // e.g. 6A × 230V = 1380W
+evChargingW      = EVChargeLoad sensor (W)   // actual 3-phase measured watts
 netGridW         = max(0, (gridImport − gridExport) × 1000 − evChargingW)
-dischargeTargetW = max(0, gridImport × 1000 − evChargingW)
+dischargeTargetW = max(0, homeImportW)        // house load only, EV removed
 ```
-
-`lastEvAmps` is stored in context by the EV controller each cycle and read back by the EMS on the next cycle.
-
-### Solar-aware charge rate (v3.17)
-
-During the planned charge window, when solar will cover part of `kwhNeeded`, the grid charge rate is reduced proportionally to avoid unnecessary grid import while solar does the heavy lifting:
-
-```javascript
-solarCoverageRatio = min(1.0, solarAfterCheapWindow / kwhNeededForGrid)
-solarAdjFraction   = max(MIN_SOLAR_GRID_FRACTION=0.20, fraction × (1 − solarCoverageRatio))
-targetAmps         = maxAllowedChargeA × solarAdjFraction
-```
-
-### Charge reason strings
-
-| Trigger | Reason string |
-|---|---|
-| Critical SoC | `Critical SoC (19%) - charging at max 155 A` |
-| Planner window, solar adjusted | `Planner: cheapest window (0.060 EUR) - charging at 29 A (solar covers 90% of grid need, reduced from 146 A). Hours: 12h,13h,14h` |
-| Planner window, no solar | `Planner: cheapest window (0.127 EUR) - charging at 94 A. Hours: 12h,13h,14h` |
-| Price override | `Price override: 41% of avg (0.078 EUR) below threshold - charging at 155 A outside planned window` |
-| Negative price with solar | `Negative price (-0.084 EUR/kWh) - charging at 123 A (6 neg-price hour(s) remaining, spreading 30.0 kWh over window, solar covers ~42 A, grid ~81 A)` |
-| Negative price no solar | `Negative price (-0.185 EUR/kWh) - charging at 10 A (4 neg-price hour(s) remaining, spreading 1.2 kWh over window)` |
-| Solar pre-discharge | `Solar pre-discharge: solar will fill battery before cheap window - discharging 72 A (target SoC 72%, freeing 3.0 kWh for cheap grid charging)` |
-| Neg-price pre-discharge | `Pre-discharge: neg price in 3h (4 neg hour(s)) - discharging 194 A to free 28.0 kWh over 3h (SoC 85% → 15%)` |
 
 ---
 
-## EV Charge Controller (v1.2) — How It Works
+## EV Charge Controller (v2.2) — How It Works
 
-The EV controller runs at the end of the EMS Decision Engine function node. It shares all EMS calculated values and outputs a second message for the Zaptec charger. The EMS function node must be set to **2 outputs**.
+The EV controller runs at the end of the EMS Decision Engine function node. It shares all EMS calculated values and outputs a second message for the Zaptec charger.
+
+### DSMR phase readings — ground truth
+
+The DSMR P1 port reads the main grid meter. Phase readings (`phaseL1/2/3LoadA`) are the **actual amps on the wire** including EV, house, and everything else. The EMS uses these directly — no add-back of EV amps is needed or correct.
+
+### Overload protection (v2.2)
+
+When any raw DSMR phase exceeds 20A, the EV controller responds in two steps:
+
+1. **Project what 6A L1 would do** — calculate what each phase would read after dropping the EV to 6A single-phase (L2/L3 lose all EV load, L1 loses `lastEvAmps − 6`)
+2. **Decide based on projection:**
+   - If 6A resolves the overload → **soft cut**: drop to 6A L1, keep charging, no session cut
+   - If 6A still leaves any phase over 20A → **session cut**: drop to 5A (pauses charging, session stays alive)
+
+The 5A session cut path is a last resort for genuine house load spikes (e.g. oven + kettle). Under normal EV charging conditions, 6A always resolves the overload because the EV itself caused it.
+
+### Post-cut ramp recovery (v2.1+)
+
+After any session cut (5A), the EV controller enters a cooldown period before ramping back up:
+
+- **Cooldown** (`EV_CUT_COOLDOWN_POLLS = 10` polls): EV holds at 6A single-phase. No ramp, no 3-phase.
+- **Ramp phase**: once cooldown expires, the controller counts consecutive polls with no overload (`evRampClearCount`). Every `EV_RAMP_UP_POLLS = 4` consecutive clear polls adds 1A to the target.
+- Night ramp: `maxAllowed = min(10, max(6, lastEvAmps) + floor(rampClearCount / 4))`
+
+This prevents the flap loop where a session cut causes Zaptec to reset the session to `connected_finished`, which the old logic interpreted as a fresh session and immediately jumped back to 8–10A, triggering another overload.
 
 ### EV charging rules
 
-| Priority | Condition | EV amps | Reason |
-|---|---|---|---|
-| 1 | Car not connected | 0 | Off — `zaptecMode = disconnected` or `connected_finished` |
-| 2 | Blackout 17h–19h | 0 | Cooking peak — never charge during this window |
-| 3 | Night 01h–06h | 8 A | Mandatory night charging regardless of price |
-| 4 | In cheap price window | evEffectiveMax | Price ≤ avg × 0.55 and in planner window |
-| 5 | Price override | evEffectiveMax | Price ≤ 80% of avg AND ≤ avg × 0.55 |
-| 6 | Solar surplus ≥ 4200 W | evEffectiveMax | Absorb 3-phase solar export into EV |
-| 7 | Cheapest hour fallback | evEffectiveMax | Cheapest hour AND price ≤ chargeAbsMax |
-| 8 | None of above | 0 | Paused |
+| Priority | Condition | EV amps | Phase mode |
+| --- | --- | --- | --- |
+| 1 | Car not connected | 0 | — |
+| 2 | Car full (`connected_finished` + SoC ≥ 100%) | 0 | — Zaptec manages session |
+| 3 | Session cut active (`l1SessionCut`) | 5 | L1 single-phase |
+| 4 | Post-cut cooldown (`inCutCooldown`) | 6 | L1 single-phase |
+| 5 | Soft cut (`l1SoftCut`) — 6A resolves overload | 6 | L1 single-phase |
+| 6 | Blackout 17h–19h | 5 | L1 — session kept alive |
+| 7 | Battery discharging | 6 | L1 single-phase |
+| 8 | Night 23h–06h, 3-phase headroom | 8–10 (ramped) | 3-phase |
+| 9 | Cheap price / solar surplus | up to 10 (ramped) | 3-phase if ≥ 7A |
+| 10 | Baseline | 6 | L1 single-phase |
 
 **Key rules:**
-- The EV **never charges from the battery** — EV load is subtracted from `netGridW` so the battery only sees home load. The battery discharge guard was removed in v3.26 because the subtraction already prevents double-dipping
-- **Blackout window 17h–19h** — EV always paused during cooking peak regardless of price or solar
-- **Mandatory night charging 01h–06h** — EV always charges at `EV_NIGHT_AMPS` (8A) regardless of price; `evEffectiveMax` can go up to `EV_NIGHT_MAX_AMPS` (10A) if phase headroom allows
-- **3-phase load** — Zaptec Go charges on all 3 phases simultaneously. `evChargingW = evAmps × 230V × 3`. Solar surplus threshold is 4200W (6A × 230V × 3)
-- EV load is read from `sensor.sloeierd_laadvermogen` (actual watts) not calculated from commanded amps — accurately reflects real consumption including when car is full or throttling
-- **Pausing** uses `switch.sloeierd_opladen` (off) not 0A — Zaptec minimum is 6A so 0A does not pause
-- Zaptec writes are rate-limited to once per 15 minutes or on state change per Zaptec API recommendation
-- The cheapest hour fallback only fires when `cheapestPrice <= chargeAbsMax` — prevents charging on expensive flat-price days
 
-### EV Output Router
+- **6A is the absolute minimum** — the EV never goes below 6A unless `l1SessionCut` fires (house itself over 20A with EV already at 6A), in which case 5A keeps the session alive
+- **Blackout 17h–19h** — always 5A (session alive, no actual charging) regardless of price or solar
+- **Night window 23h–06h** — charges at 8–10A on 3-phase; ramps up slowly after any overload event rather than jumping straight to max
+- **3-phase mode** — Zaptec Go uses all 3 phases when commanded ≥ 7A; below 7A it uses L1 only
+- **EV never charges from battery** — EV load is subtracted from `netGridW` so the battery only sees home load
+- **Pausing**: 5A keeps the Zaptec session alive below the 6A charge threshold; 0A does not pause (use the switch for a true pause)
 
-Sits between EMS output 2 and the Zaptec service nodes. Handles rate limiting so Zaptec receives commands at most once per 15 minutes, or immediately when charging state changes. Has 3 outputs:
-
-- **Output 1** → Switch node routing `msg.payload (bool)` to `Turn ON` or `Turn OFF` (`switch.sloeierd_opladen`)
-- **Output 2** → `Set Zaptec current` — only fires when `evCharging = true`; uses `msg.zaptecValue` (float)
-- **Output 3** → `EV Diagnostics` debug — always fires every cycle
-
-Outputs 1 and 2 return `null` when rate-limited and state unchanged — Node-RED drops nulls automatically.
-
-### EV session cost tracking (v3.44)
-
-The EV controller tracks charging cost per session and compares to public charger rate:
+### EV session cost tracking (v3.44+)
 
 ```
 evSessionKwh     — kWh charged this session (resets on disconnect)
@@ -437,38 +450,48 @@ The session resets automatically when the car disconnects. Long-term totals are 
 
 ### EV rate limiting
 
-Rate limiting is handled in the **EV Output Router** node (not in the EMS). The router writes to Zaptec when:
-1. The charging state changes (on → off or off → on) — immediate response
-2. 15 minutes have elapsed since last write — periodic refresh
+Rate limiting is handled in the **EV Output Router** node. The router writes to Zaptec when:
 
-This ensures Zaptec always receives the correct state after a restart, while respecting the 15-minute API recommendation during steady state.
+1. The target amps value changes — immediate response
+2. 15 minutes have elapsed since last write — periodic refresh
 
 ### EV diagnostic output (output 2)
 
-```javascript
+```json
 {
-  payload: {
-    version:      "EV v2.0",
-    targetAmps:   6.0,
-    carConnected: true,
-    reason:       "Cheapest hour fallback (0.177 EUR) - EV charging at 6 A (best available)",
-    inputs: {
-      zaptecMode:     "connected_requesting",
-      currentPrice:   0.177,
-      avgPrice:       0.238,
-      surplus_W:      0,
-      discharging:    false,
-      lastEvAmps:     0,
-      cheapestHour:   14,
-      cheapestPrice:  0.177,
-      evCheapestHour: 14,
-      currentHour:    14,
-      timeSince_s:    904
+  "payload": {
+    "version": "EV v2.2",
+    "targetAmps": 8.0,
+    "carConnected": true,
+    "reason": "Night charging (0.082 EUR) - 8A [3-phase, max 10A] ramp=3/4 (headroom: L1=9 L2=11 L3=10)",
+    "inputs": {
+      "zaptecMode": "connected_charging",
+      "currentPrice": 0.082,
+      "avgPrice": 0.210,
+      "lastEvAmps": 8,
+      "currentHour": 1,
+      "evInNight": true,
+      "evPhaseMode": "3-phase",
+      "phaseL1LoadA": 11.2,
+      "phaseL2LoadA": 9.3,
+      "phaseL3LoadA": 10.1,
+      "projL1At6A": 9.2,
+      "projL2At6A": 1.3,
+      "projL3At6A": 2.1,
+      "anyOver20": false,
+      "sixAmpResolves": true,
+      "l1SessionCut": false,
+      "l1SoftCut": false,
+      "inCutCooldown": false,
+      "evCutCooldown": 0,
+      "evRampClearCount": 3,
+      "worst3PhaseA": 9.7,
+      "l1OverloadCount": 0
     }
   },
-  zaptecValue:   6.0,    // use {{zaptecValue}} in Set Zaptec current node
-  evTargetAmps:  6,
-  evShouldWrite: true
+  "zaptecValue": 8.0,
+  "evTargetAmps": 8,
+  "evShouldWrite": false
 }
 ```
 
@@ -476,62 +499,41 @@ This ensures Zaptec always receives the correct state after a restart, while res
 
 ## Diagnostic Output Structure — Battery (output 1)
 
-```javascript
-msg.payload = {
-  version:     "EMS v3.45 / Planner v2.14",
-  dc_amps:     0,        // amps when charging, 0 when discharging
-  dc_power:    5616,    // watts when discharging (117A × 48V), 0 when charging
-  charging:    false,
-  discharging: true,
-  reason:      "High price (128% of avg, 0.261 EUR) - discharging 117 A to cover 4178 W gross import + 800 W export bias",
-
-  planner: {
-    inWindow:               false,
-    inDischargeWindow:      true,
-    inPreDischargeWindow:   false,
-    inSolarPreDischargeWindow: false,
-    preDischargeHours:      [],
-    solarPreDischargeHours: [],
-    solarPreDischargeTargetSoC: 15,
-    hoursUntilNegWindow:    null,
-    futureNegHoursCount:    0,
-    negPriceHoursRemaining: 0,
-    dischargeThreshold:     0.244,
-    hoursNeeded:            3,
-    kwhNeeded:              29.6,
-    kwhFromGrid:            8.2,
-    solarForecastKwh:       21.4,
-    solarAfterCheapWindow:  14.1,
-    kwhNeededForGrid:       8.2,
-    cheapestPrice:          0.060,
-    cheapestHour:           13,
-    plannedHours:           [12, 13, 14],
-    plannedDischargeHours:  [19, 20, 21, 22, 23],
-    reason:                 "Need 29.6 kWh total, solar covers ~21.4 kWh, 8.2 kWh from grid (3h)..."
+```json
+{
+  "version": "EMS v3.71 / Planner v2.14",
+  "dc_amps": 0,
+  "dc_power": 5616,
+  "charging": false,
+  "discharging": true,
+  "reason": "High price (128% of avg, 0.261 EUR) - discharging 117 A to cover 4178 W gross import + 800 W export bias",
+  "planner": {
+    "inWindow": false,
+    "inDischargeWindow": true,
+    "hoursNeeded": 3,
+    "kwhNeeded": 29.6,
+    "cheapestPrice": 0.060,
+    "cheapestHour": 13,
+    "plannedHours": [12, 13, 14],
+    "plannedDischargeHours": [19, 20, 21, 22, 23]
   },
-
-  inputs: {
-    currentPrice:        0.261,
-    avgPrice:            0.205,
-    priceRatio:          127.6,
-    chargeAbsMax:        0.113,
-    dischargeAbsMin:     0.113,
-    lastState:           "discharging",
-    batterySoC:          22,
-    solarTotal_W:        1530,
-    netGrid_W:           4178,       // EV load already subtracted
-    dischargeTarget_W:   4178,       // EV load already subtracted
-    actualSurplus_W:     0,
-    evCharging_W:        0,          // W currently consumed by EV
-    evLastAmps:          0,          // A commanded to Zaptec last cycle
-    phaseL1_A:           4.05,
-    phaseL2_A:           3.84,
-    phaseL3_A:           10.28,
-    maxPhaseLoad_A:      10.28,
-    worstHeadroom_A:     5.72,
-    gridHeadroom_W:      3948,
-    maxAllowedCharge_A:  70,
-    timestamp:           "2026-05-03T12:40:52.533Z"
+  "inputs": {
+    "currentPrice": 0.261,
+    "avgPrice": 0.205,
+    "priceRatio": 127.6,
+    "batterySoC": 22,
+    "solarTotal_W": 1530,
+    "netGrid_W": 4178,
+    "dischargeTarget_W": 4178,
+    "actualSurplus_W": 0,
+    "evCharging_W": 0,
+    "evLastAmps": 0,
+    "phaseL1_A": 4.05,
+    "phaseL2_A": 3.84,
+    "phaseL3_A": 10.28,
+    "maxPhaseLoad_A": 10.28,
+    "worstHeadroom_A": 5.72,
+    "maxAllowedCharge_A": 70
   }
 }
 ```
@@ -541,7 +543,7 @@ msg.payload = {
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | Always idle, dc_amps 0 | Wrong entity names | Use Developer Tools → States to verify all entity IDs |
 | `priceRatio` always 100% | `avgPrice` = 0 | Check Frank Energie entity has `attributes.prices` populated |
 | `inChargingWindow: null` | Frank Energie array empty | Check planner node status — yellow dot = no price data |
@@ -555,86 +557,55 @@ msg.payload = {
 | Solar forecast not deducting | `solarForecastRemaining` = 0 | Check `get-solar-forecast` node; verify `sensor.energy_production_remaining_today` |
 | `[confirming 1/2]` in reason | State pending confirmation | Normal — resolves next cycle |
 | `maxAllowedCharge_A: 0` | Home load near grid limit | Large appliance consuming headroom — EMS resumes when load drops |
-| Charging at max during negative price | Old pre-v3.10 script | Update to EMS v3.10+ for spread charging |
-| Battery fills before cheap window (solar) | Solar overfill not detected | Check `Set solarNow` node is in chain before Price Planner; update to Planner v2.14+ |
-| Charging planned at expensive evening hours | Old pre-v2.12 planner | Charge window validity gate missing — update to Planner v2.12+ |
-| Negative amps / wrong Deye value | Old pre-v3.13 EMS | `fraction` not clamped — update to EMS v3.13+ |
 | Battery discharging to cover EV load | Old pre-v3.18 EMS | EV load subtraction missing — update to EMS v3.18+ |
-| EV always 0A despite cheap price | EMS node set to 1 output | Change EMS function node outputs to 2; wire output 2 to Set Zaptec current |
+| EV always 0A despite cheap price | EMS node set to 1 output | Change EMS function node outputs to 2; wire output 2 to EV Output Router |
 | Set Zaptec current: Invalid JSON | Wrong data field template | Use `{"value": {{zaptecValue}}}` and uncheck Block input overrides |
-| EV charges at wrong time | `cheapestHour` not passed | Ensure Planner v2.14+ deployed; `msg.cheapestHour` must be set |
-| EV paused while battery discharges | Old pre-v3.26 EMS | Battery discharge guard removed in v3.26 — update to EMS v3.26+ |
-| EV not pausing despite 0A command | Zaptec 6A minimum | Use `switch.sloeierd_opladen` off to actually pause — EV Output Router handles this |
-| EV charges during cooking hour | Old pre-v3.24 EMS | Blackout window 17h-19h missing — update to EMS v3.24+ |
-| EV not charging overnight | Old pre-v3.27 EMS | Mandatory night charging missing — update to EMS v3.27+ |
-| EV load not subtracted correctly | Single-phase calculation | EMS v3.19+ uses `× 3` for 3-phase; verify `sensor.sloeierd_laadvermogen` reports total W |
-| EV load sensor showing 0 when charging | Wrong entity | Check `sensor.sloeierd_laadvermogen` in Developer Tools → States when car is actively charging |
-| `timeSince_s` very large on first run | Context default 0 | Normal on first deploy — resets after first write cycle |
-| Solar surplus charging during discharge window | Old pre-v3.15 script | Update to EMS v3.15+ |
+| EV not pausing despite 0A command | Zaptec 6A minimum | Use `switch.sloeierd_opladen` off for a true pause — 5A keeps session alive |
+| EV session cut flap loop | Old pre-v3.70 EMS | EV add-back doubled phase load causing phantom overloads — update to EMS v3.71+ |
+| EV phases showing ~2× actual amps | Old pre-v3.71 EMS | Phase add-back bug — update to EMS v3.71+ which uses raw DSMR directly |
+| EV drops to 5A when house load is fine | Old pre-v3.71 EMS | Wrong session cut rule — update to EMS v3.71+ |
+| EV jumps to 8–10A right after a cut | Old pre-v3.70 EMS | Missing ramp recovery — update to EMS v3.70+ |
 | Solar surplus not detected while EV charging | Old pre-v3.45 script | EV load clamp hid surplus — update to EMS v3.45+ |
 | Battery charging slowly during cheap window | Old pre-v3.40 script | Solar adjustment was throttling — update to EMS v3.40+ |
-| Battery charging above 100A | Old pre-v3.42 script | MAX_AMPS was 200 — update to EMS v3.42+ |
-| Critical SoC firing at 20% | Old pre-v3.39 script | SOC_CRITICAL was 20% — update to EMS v3.39+ |
 | dc_amps set during discharge | Old pre-v3.43 script | dc_amps/dc_power not split — update to EMS v3.43+ |
-| Discharge window wrong size or hours | Old pre-v2.13 planner | Update to Planner v2.13+ for centered expansion |
 
 ---
 
 ## Version History
 
 | Version | Date | Change |
-|---|---|---|
-| **EMS v3.27** | 2026-05-05 | Mandatory night charging 01h-06h at `EV_NIGHT_AMPS` (8A) per phase regardless of price — guarantees ~27.6 kWh available each night |
-| **EMS v3.26** | 2026-05-05 | Removed EV pause-on-battery-discharge guard — EV load subtraction already prevents battery from covering EV consumption |
-| **EMS v3.25** | 2026-05-05 | Night mode 01h-06h: `evEffectiveMax` up to `EV_NIGHT_MAX_AMPS` (10A) based on phase headroom |
-| **EMS v3.24** | 2026-05-04 | EV blackout window 17h-19h — no EV charging during cooking peak regardless of price |
-| **EMS v3.23** | 2026-05-04 | EV cheapest hour fallback tightened to `chargeAbsMax` (avg × 0.55) — prevents charging on expensive flat-price days |
-| **EMS v3.22** | 2026-05-04 | EMS output 2 always fires every cycle; rate limiting moved to EV Output Router node |
-| **EMS v3.21** | 2026-05-04 | `evCharging` bool added to EV message; `zaptecValue` float exposed for Zaptec node |
-| **EMS v3.20** | 2026-05-04 | EV load read from `msg.EVChargeLoad` (actual sensor watts) with fallback to commanded amps × 3-phase; `evSensorUsed` diagnostic field |
-| **EMS v3.19** | 2026-05-04 | EV load corrected to 3-phase: `evChargingW = lastEvAmps × GRID_VOLTAGE × 3`; `EV_SOLAR_MIN_W` raised to 4200W |
-| **EMS v3.18** | 2026-05-03 | EV Charge Controller v1.2 integrated as second output; EV load subtracted from `netGridW` and `dischargeTargetW` so battery never compensates for EV grid draw |
-| **EMS v3.17** | 2026-05-02 | Solar-aware charge rate: grid charge amps reduced proportionally when solar forecast covers part of `kwhNeeded`; floor at 20% of max |
-| **EMS v3.16** | 2026-05-01 | Solar overfill pre-discharge branch added — discharges to `solarPreDischargeTargetSoC` when solar will fill battery before cheap window |
+| --- | --- | --- |
+| **EMS v3.71 / EV v2.2** | 2026-05-14 | Phase loads now read directly from raw DSMR — no EV add-back; DSMR reads the main meter which already includes EV load; adding EV amps back was doubling the EV contribution and creating phantom overloads; overload logic simplified: if any DSMR phase >20A, project what 6A L1 would give; if 6A resolves it → soft cut (6A, keep charging); if not → session cut (5A); `houseOnlyLx`/`houseAloneOver20` removed; new diagnostics: `projL1/2/3At6A`, `anyOver20`, `sixAmpResolves` |
+| **EMS v3.70 / EV v2.1** | 2026-05-14 | Session cut rule corrected: only cut session (5A) when house load alone exceeds 20A after removing EV contribution; if EV caused the overload → 6A soft cut (keep charging); post-cut ramp recovery: `EV_CUT_COOLDOWN_POLLS=10` polls at 6A after any cut, then `EV_RAMP_UP_POLLS=4` consecutive clear polls per 1A increase — prevents jumping back to 8–10A; new diagnostics: `houseOnlyL1/L2/L3`, `houseAloneOver20`, `inCutCooldown`, `evCutCooldown`, `evRampClearCount` |
+| **EMS v3.69 / EV v2.0** | 2026-05-13 | `evCarFull` (connected_finished + evSoC ≥ 100%) sends 0A — Zaptec manages session when car is full |
+| **EMS v3.68** | 2026-05-13 | Smarter overload response: try 6A L1 before dropping to 5A; 9 bug fixes including `EV_3PHASE_MIN_A` used before defined, phase add-back correction, night safety net overwrite |
+| **EMS v3.67** | 2026-05-12 | Per-phase overload detection; EV phase add-back corrected to only add to phases EV actually uses |
+| **EMS v3.65** | 2026-05-11 | Blackout window 17h–19h set to 5A (session alive, pauses charging) |
+| **EV v2.0** | 2026-05-10 | Complete EV rewrite: baseline 6A 24/7; night 23h–06h up to 10A 3-phase; per-phase headroom; graduated overload response; solar surplus scaling; battery discharge cap; blackout 17h–19h; phase mode hysteresis; session accumulator |
 | **EMS v3.45** | 2026-05-09 | Solar surplus detection uses `rawNetGridW` before EV clamp — fixes surplus not detected when EV charging pushes `netGridW` to 0 |
-| **EMS v3.44** | 2026-05-09 | EV session cost tracking: `evSessionKwh`, `evSessionCostAct`, `evSessionCostPub`, `evSessionSaving`; `EV_PUBLIC_RATE = 0.50` €/kWh reference |
-| **EMS v3.43** | 2026-05-09 | `dc_amps` only set when charging (0 when discharging); `dc_power` only set when discharging (0 when charging) |
+| **EMS v3.44** | 2026-05-09 | EV session cost tracking: `evSessionKwh`, costs, savings vs public charger |
+| **EMS v3.43** | 2026-05-09 | `dc_amps` only when charging; `dc_power` only when discharging |
 | **EMS v3.42** | 2026-05-09 | `MAX_AMPS` reduced to 100A safe limit |
-| **EMS v3.41** | 2026-05-09 | `MAX_AMPS` reduced to 125A |
-| **EMS v3.40** | 2026-05-09 | Solar-aware charge rate removed from planned cheap window — always charge at full amps when `inChargingWindow=true` |
-| **EMS v3.39** | 2026-05-09 | `SOC_CRITICAL` lowered to 15% (same as `SOC_DISCHARGE_MIN`); critical charge requires `price <= avgPrice × 0.70` |
-| **EV v2.0** | 2026-05-07 | Complete EV rewrite: baseline 6A 24/7; night 00h–06h up to 10A; phase-aware headroom; L1 dual-threshold safety; solar surplus scaling; battery discharge cap; blackout 17h–19h |
-| **EMS v3.15** | 2026-04-28 | Solar surplus charging suppressed during `inDischargeWindow` — discharge takes priority in evening peak |
-| **EMS v3.14** | 2026-04-28 | Min-discharge suppressed when solar surplus > `SOLAR_SUPPRESS_DISCHARGE_W` (500 W) |
-| **EMS v3.13** | 2026-04-26 | `fraction` clamped to [0.10, 1.0] — prevents negative dc_amps; charge window validity gate |
+| **EMS v3.40** | 2026-05-09 | Solar-aware charge rate removed from planned window — always charge at full amps when `inChargingWindow=true` |
+| **EMS v3.39** | 2026-05-09 | `SOC_CRITICAL` lowered to 15%; critical charge requires `price <= avgPrice × 0.70` |
+| **EMS v3.27** | 2026-05-05 | Mandatory night charging; `EV_NIGHT_AMPS` (8A) regardless of price |
+| **EMS v3.26** | 2026-05-05 | Removed EV pause-on-battery-discharge guard — EV load subtraction already prevents double-dipping |
+| **EMS v3.24** | 2026-05-04 | EV blackout window 17h–19h |
+| **EMS v3.18** | 2026-05-03 | EV Charge Controller integrated as second output; EV load subtracted from `netGridW` and `dischargeTargetW` |
+| **EMS v3.16** | 2026-05-01 | Solar overfill pre-discharge branch |
+| **EMS v3.15** | 2026-04-28 | Solar surplus charging suppressed during discharge window |
+| **EMS v3.13** | 2026-04-26 | `fraction` clamped to [0.10, 1.0] |
 | **EMS v3.12** | 2026-04-26 | Pre-discharge before negative price windows |
-| **EMS v3.11** | 2026-04-26 | Solar surplus offsets grid draw during negative price charging |
-| **EMS v3.10** | 2026-04-26 | Negative price charging spread across full negative window |
+| **EMS v3.10** | 2026-04-26 | Negative price charging spread across full window |
 | **EMS v3.9** | 2026-04-26 | Hard `canCharge` ceiling — no negative price override |
-| **EMS v3.8** | 2026-04-26 | `SOC_CRITICAL` requires `currentPrice <= chargeAbsMax` |
-| **EMS v3.7** | 2026-04-25 | `isPriceVeryLow` ratio override; distinct reason strings |
+| **EMS v3.7** | 2026-04-25 | `isPriceVeryLow` ratio override |
 | **EMS v3.6** | 2026-04-25 | `SOC_CRITICAL` boundary fix; `isPriceHigh` avgPrice guard |
-| EMS v3.5 | 2026-04-20 | `canDischarge` bug fixed; `ROUND_TRIP_EFF` removed from discharge |
-| EMS v3.4 | 2026-04-19 | Fixed thresholds replaced with `avgPrice` ratios |
-| EMS v3.3 | 2026-04-15 | Solar surplus `canChargeSolar`; moved before discharge branch |
-| EMS v3.2 | 2026-04-12 | `SOC_DISCHARGE_MIN` 15%; gross import as discharge base |
-| EMS v3.1 | 2026-04-10 | `SOC_DISCHARGE_MIN` 15%; `SOC_CRITICAL` 20% |
-| EMS v3.0 | 2026-04-08 | P1 phase readings for per-phase headroom |
-| **EV v1.2** | 2026-05-03 | `cheapestHour` parsed with `parseInt` to handle string/null; `evCheapestHour` debug field added |
-| **EV v1.1** | 2026-05-03 | Integrated into EMS v3.18 as second output; `currentHour` defined; `zaptecValue` float for Zaptec node; full diagnostic payload |
-| **EV v1.0** | 2026-05-03 | Initial standalone EV Charge Controller |
-| **Planner v2.14** | 2026-05-02 | Solar deduction split into before/after cheap window; solar overfill pre-discharge using real-time production rate; `MIN_GRID_CHEAP_KWH = 3.0` always reserves room for cheapest-hour grid charging; `cheapestHour` added to outputs |
-| **Planner v2.13** | 2026-04-28 | Discharge window centered on most expensive hour, sized from usable capacity; `LATE_BIAS_EUR` |
+| **EMS v3.5** | 2026-04-20 | `canDischarge` bug fixed; `ROUND_TRIP_EFF` removed from discharge |
+| **EMS v3.0** | 2026-04-08 | P1 phase readings for per-phase headroom |
+| **Planner v2.14** | 2026-05-02 | Solar deduction split before/after cheap window; solar overfill pre-discharge; `MIN_GRID_CHEAP_KWH = 3.0`; `cheapestHour` output |
+| **Planner v2.13** | 2026-04-28 | Discharge window centered on most expensive hour; `LATE_BIAS_EUR` |
 | **Planner v2.12** | 2026-04-26 | Charge window validity gate |
 | **Planner v2.11** | 2026-04-26 | Pre-discharge detection before negative windows |
-| **Planner v2.10** | 2026-04-26 | `negPriceHoursRemaining` for spread charging |
-| **Planner v2.9** | 2026-04-26 | Early-hour bias in charge window expansion |
-| **Planner v2.8** | 2026-04-25 | Solar forecast deduction; `kwhFromGrid` and `solarForecastKwh` |
-| **Planner v2.7** | 2026-04-25 | Discharge band filter raised to `avgPrice` |
 | **Planner v2.6** | 2026-04-25 | Charge window centered on cheapest hour |
-| Planner v2.5 | 2026-04-20 | Price ratios aligned with EMS v3.5 |
-| Planner v2.4 | 2026-04-19 | Frank Energie as price source |
-| Planner v2.3 | 2026-04-17 | Single `PLANNER_VERSION` variable |
-| Planner v2.2 | 2026-04-15 | `SOC_NORMAL_THRESHOLD` raised to 80% |
-| Planner v2.1 | 2026-04-14 | Fixed `msg.plannerVersion` / `inWindow` bugs |
-| Planner v2.0 | 2026-04-13 | `dischargeThreshold` after conflict filter |
+| **Planner v2.4** | 2026-04-19 | Frank Energie as price source |
+| **Planner v2.0** | 2026-04-13 | `dischargeThreshold` after conflict filter |
