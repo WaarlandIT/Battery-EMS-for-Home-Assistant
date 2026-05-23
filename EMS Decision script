@@ -1,4 +1,18 @@
 // EMS Decision Engine
+// v3.74 - EV v2.5: daytime 3-phase up to 8A when isPriceVeryLow (price <=80%
+//          of avg AND <= chargeAbsMax) and phase headroom allows; uses same
+//          slow ramp (EV_RAMP_UP_POLLS) as night/zero-price charging so it
+//          won't jump straight to 8A — requires 5 min stable headroom per step
+// v3.73 - EV v2.4: slower upscale ramp — EV_RAMP_UP_POLLS raised from 4 to 10
+//          (~5 minutes at 30s polls before adding 1A when stepping 8→9→10A);
+//          ramp counter now only resets on l1SoftCut (actual EV-caused overload)
+//          instead of any overloadTriggered — minor phase spikes / warn-threshold
+//          crossings no longer wipe accumulated stable time, preventing the
+//          oscillation seen when a house load sits near the headroom boundary
+// v3.72 - EV v2.3: daytime 3-phase ramp only at price <= 0 (zero or negative);
+//          previously fired at isPriceVeryLow (<=80% of avg) or cheap window —
+//          way too generous; during the day EV stays at 6A L1 baseline unless
+//          price is zero/negative or solar surplus covers 3-phase load
 // v3.71 - EV v2.2: use raw DSMR phase amps directly — no add-back of EV amps;
 //          DSMR reads main meter which already includes EV load, so previous
 //          add-back was doubling EV contribution and causing phantom overloads;
@@ -24,8 +38,8 @@
 // v3.65 - blackout window 17h-19h set to 5A
 // (prior versions: see v3.69 header)
 
-var EMS_VERSION = 'EMS v3.71';
-var EV_VERSION  = 'EV v2.2';
+var EMS_VERSION = 'EMS v3.74';
+var EV_VERSION  = 'EV v2.5';
 
 var CFG = {
   MAX_AMPS:             100,
@@ -349,23 +363,15 @@ node.status({
   text:  EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
 });
 
-// ── EV Charge Controller v2.1 ─────────────────────────────────────────────────
+// ── EV Charge Controller v2.5 ─────────────────────────────────────────────────
 //
-// KEY CHANGES vs v2.0:
+// KEY CHANGES vs v2.4:
 //
-// 1. SESSION CUT RULE:
-//    Only cut the session (drop to 5A) when the house alone — with EV
-//    contribution removed from all phases — still exceeds 20A.
-//    If the house is fine and the EV caused the overload, cap to 6A (no cut).
-//    Rule: l1SessionCut = overloadTriggered && houseAloneOver20
-//          l1SoftCut    = overloadTriggered && !houseAloneOver20  → 6A, keep charging
-//
-// 2. SLOW RAMP AFTER SESSION CUT:
-//    On session cut: evCutCooldown = EV_CUT_COOLDOWN_POLLS (10), evRampClearCount = 0
-//    During cooldown: hold at 6A single-phase, decrement each poll
-//    After cooldown: count consecutive clear polls (evRampClearCount)
-//    Night ramp: maxAllowed = min(NIGHT_MAX, max(6, lastEvAmps) + floor(rampClear/4))
-//    Only add 1A per EV_RAMP_UP_POLLS consecutive clear polls — no jumping to 8-10A
+// 1. DAYTIME VERY LOW PRICE CHARGING:
+//    When isPriceVeryLow (price <= 80% of avg AND <= chargeAbsMax) and the
+//    battery is not charging, allow 3-phase EV charging up to 8A (not 10A)
+//    if phase headroom permits. Uses the same slow ramp as night charging —
+//    requires EV_RAMP_UP_POLLS (~5 min) of stable headroom per 1A step.
 
 var currentHour = new Date().getHours();
 
@@ -385,8 +391,7 @@ var EV_L1_HARD_LIMIT      = 20;
 var EV_L1_WARN_LIMIT      = 18;
 var EV_L1_OVERLOAD_CYCLES = 3;
 var EV_CUT_COOLDOWN_POLLS = 10;  // polls at 6A after a session cut before any ramp
-var EV_RAMP_UP_POLLS      = 4;   // consecutive clear polls needed to add 1A
-
+var EV_RAMP_UP_POLLS      = 10;  // v2.4: raised from 4 → 10 (~5 min at 30s polls per 1A step)
 // ── Retrieve EV persistent state ─────────────────────────────────────────────
 var evCutCooldown    = context.get('evCutCooldown')    || 0;
 var evRampClearCount = context.get('evRampClearCount') || 0;
@@ -452,6 +457,9 @@ context.set('l1OverloadCount', l1OverloadCount);
 var overloadTriggered = anyOver20;
 
 // ── Post-cut cooldown and ramp counter update ─────────────────────────────────
+// v2.4: ramp counter resets only on l1SoftCut (EV caused the overload),
+//       not on any overloadTriggered. Minor spikes that don't require a soft
+//       cut no longer wipe accumulated stable time.
 var inCutCooldown = evCutCooldown > 0;
 
 if (l1SessionCut) {
@@ -460,7 +468,7 @@ if (l1SessionCut) {
 } else if (inCutCooldown) {
   evCutCooldown--;
   evRampClearCount = 0;
-} else if (overloadTriggered) {
+} else if (l1SoftCut) {
   evRampClearCount = 0;
 } else {
   evRampClearCount++;
@@ -523,10 +531,16 @@ if (l1SessionCut || inCutCooldown) {
     maxAllowed    = Math.min(EV_NIGHT_MAX, rampBase + rampBonus);
   } else if (charging || evInHoldDown) {
     maxAllowed = EV_MIN_AMPS;
-  } else if (!charging && (isPriceVeryLow || (inChargingWindow && currentPrice <= chargeAbsMax))) {
+  } else if (!charging && currentPrice <= 0) {
+    // Daytime 3-phase only at zero or negative price — too cheap not to charge fast
     var rampBase2  = Math.max(EV_MIN_AMPS, lastEvAmps);
     var rampBonus2 = Math.floor(evRampClearCount / EV_RAMP_UP_POLLS);
     maxAllowed     = Math.min(EV_NIGHT_MAX, rampBase2 + rampBonus2);
+  } else if (!charging && isPriceVeryLow) {
+    // v2.5: daytime 3-phase up to 8A when price is very low and headroom allows
+    var rampBase3  = Math.max(EV_MIN_AMPS, lastEvAmps);
+    var rampBonus3 = Math.floor(evRampClearCount / EV_RAMP_UP_POLLS);
+    maxAllowed     = Math.min(8, rampBase3 + rampBonus3);
   } else if (hasSolarSurplus && solarSurplusPerPhaseA >= EV_3PHASE_MIN_A) {
     maxAllowed = Math.min(16, solarSurplusPerPhaseA + evCurrentPerPhase);
   } else {
@@ -719,11 +733,11 @@ var evMsg = {
       phaseL1LoadA:          parseFloat(phaseL1LoadA.toFixed(2)),
       phaseL2LoadA:          parseFloat(phaseL2LoadA.toFixed(2)),
       phaseL3LoadA:          parseFloat(phaseL3LoadA.toFixed(2)),
-      projL1At6A:            parseFloat(projL1At6A.toFixed(2)),      // v2.2
-      projL2At6A:            parseFloat(projL2At6A.toFixed(2)),      // v2.2
-      projL3At6A:            parseFloat(projL3At6A.toFixed(2)),      // v2.2
-      anyOver20:             anyOver20,                               // v2.2
-      sixAmpResolves:        sixAmpResolves,                          // v2.2
+      projL1At6A:            parseFloat(projL1At6A.toFixed(2)),
+      projL2At6A:            parseFloat(projL2At6A.toFixed(2)),
+      projL3At6A:            parseFloat(projL3At6A.toFixed(2)),
+      anyOver20:             anyOver20,
+      sixAmpResolves:        sixAmpResolves,
       l1HeadroomA:           parseFloat(l1HeadroomA.toFixed(1)),
       l2HeadroomA:           parseFloat(l2HeadroomA.toFixed(1)),
       l3HeadroomA:           parseFloat(l3HeadroomA.toFixed(1)),
@@ -731,9 +745,9 @@ var evMsg = {
       l1OverloadCount:       l1OverloadCount,
       l1SessionCut:          l1SessionCut,
       l1SoftCut:             l1SoftCut,
-      inCutCooldown:         inCutCooldown,                          // v2.1
-      evCutCooldown:         evCutCooldown,                          // v2.1
-      evRampClearCount:      evRampClearCount,                       // v2.1
+      inCutCooldown:         inCutCooldown,
+      evCutCooldown:         evCutCooldown,
+      evRampClearCount:      evRampClearCount,
       evInHoldDown:          evInHoldDown,
       holdDownCount:         holdDownCount,
       phaseDropCount:        phaseDropCount,
