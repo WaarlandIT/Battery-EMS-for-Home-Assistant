@@ -1,4 +1,9 @@
 // EMS Decision Engine
+// v3.75 - Hard stop: if batterySoC >= 97% charging is unconditionally blocked
+//          regardless of price, planner window, or solar surplus — overrides
+//          all branches just before msg.payload is built; prevents battery
+//          fault from overcharging when SoC sensor lags or inverter absorption
+//          carries SoC past SOC_MAX after the EMS has already gone idle
 // v3.74 - EV v2.5: daytime 3-phase up to 8A when isPriceVeryLow (price <=80%
 //          of avg AND <= chargeAbsMax) and phase headroom allows; uses same
 //          slow ramp (EV_RAMP_UP_POLLS) as night/zero-price charging so it
@@ -38,7 +43,7 @@
 // v3.65 - blackout window 17h-19h set to 5A
 // (prior versions: see v3.69 header)
 
-var EMS_VERSION = 'EMS v3.74';
+var EMS_VERSION = 'EMS v3.75';
 var EV_VERSION  = 'EV v2.5';
 
 var CFG = {
@@ -312,6 +317,19 @@ if (targetAmps === 0) { charging = false; discharging = false; }
 
 var dc_amps  = charging    ? targetAmps : 0;
 var dc_power = discharging ? targetAmps * CFG.BATTERY_VOLTAGE : 0;
+
+// ── Hard ceiling — overrides all branches ────────────────────────────────────
+// If SoC reaches 97% or above, block charging unconditionally regardless of
+// price, planner window, or solar surplus. Prevents battery fault from
+// overcharging when the SoC sensor lags or inverter absorption carries SoC
+// past SOC_MAX after the EMS has already gone idle.
+var SOC_HARD_STOP = 97;
+if (batterySoC >= SOC_HARD_STOP && charging) {
+  charging   = false;
+  targetAmps = 0;
+  dc_amps    = 0;
+  reason     = 'HARD STOP: SoC ' + batterySoC + '% >= ' + SOC_HARD_STOP + '% — charging blocked to protect battery';
+}
 
 msg.payload = {
   version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),
