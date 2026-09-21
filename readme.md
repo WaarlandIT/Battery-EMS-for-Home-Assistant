@@ -1,15 +1,20 @@
 Battery EMS – Node-RED Setup & Reference Guide
 EMS v3.85 / Planner v2.14 / EV v2.14 — Updated 21 September 2026
 ![Node-red layout](https://github.com/WaarlandIT/Battery-EMS-for-Home-Assistant/raw/main/NodeRed.png)
+
 ---
 My Setup
+
 This flow was built around a Growatt inverter for the solar array and a Deye inverter for the battery bank. A Zaptec Go EV charger is also integrated — smart price-based EV charging runs as part of the same flow. The battery inverter connection is not included in this flow — how the DC amps, charging, and discharging booleans are wired to your inverter depends entirely on your hardware. The entity names used here reflect my installation; adjust them to match yours.
 Why Frank Energie for pricing? Frank Energie provides open API access to the actual day-ahead market prices (APX/EPEX) used in the Netherlands. Even if you are on a different energy provider, these price curves accurately reflect the real market variation throughout the day — all Dutch dynamic tariff providers use the same underlying wholesale market, just with different markups on top. Using the raw market curve gives the best signal for when to charge and discharge.
 After importing the flow into Node-RED, several nodes will show a red triangle — this is expected. Those nodes reference Home Assistant entities that need to be mapped to your specific installation. Go through each red node and update the entity ID to match what appears in your Developer Tools → States. The entity names documented in this guide are the ones used in my setup; yours may differ, especially for the DSMR meter, battery SoC sensor, and solar inverter.
+
 ---
 Prerequisites
+
 Install in Node-RED via Manage palette:
 `node-red-contrib-home-assistant-websocket` — all Home Assistant nodes
+
 ---
 Home Assistant Integrations
 All integrations must be installed and working before the EMS flow can function.
