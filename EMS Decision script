@@ -1,50 +1,58 @@
 // EMS Decision Engine
+// v3.90 - EV v2.19: fixes from full simulation review —
+//          (1) battery state machine: amps computed for one direction could be
+//              applied in the other during confirmation / forced idle (e.g.
+//              discharging at charge amps for a cycle) and the idle step
+//              between charge and discharge could be skipped; lastState is now
+//              stored after confirmation and after the hard stop
+//          (2) EV ramp: counter never reset after a step-up, so after the first
+//              15 min the EV climbed 1A per poll; now max +1A per earned
+//              window, counter resets on every step-up and does not accumulate
+//              while no car is connected
+//          (3) single-phase EV load (6A L1) is subtracted from the battery
+//              discharge target and added back to L1 headroom
+//          (4) headroom add-back only when EV current is actually flowing
+//          (5) overload cut logic only runs when a car is connected
+//          (6) negative-price minimum charge no longer overrides grid headroom
+//          (7) Zaptec finished-early nudge limited to 3 attempts per episode
+//              and skipped when ev_soc is unavailable
+//          (8) l1HardOverload / l1WarnOverload exposed for the logger
+// v3.89 - Bug fixes: evPhaseMode and evCanCharge now always set in all
+//          branches of evSafeAmps determination — were undefined in the solar
+//          surplus L1 fallback branch; dischargeTargetW corrected when EV not
+//          charging (was subtracting 0, now clearly gridImport * 1000)
+// v3.88 - Bug fixes: evLastAmps reset on disconnect; removed dead vars
+// v3.87 - Cleanup: removed dead code (l1GraduatedCut, sixAmpResolves,
+//          overloadTriggered, EV_L1_OVERLOAD_CYCLES, EV_MAX_AMPS,
+//          EV_SOLAR_MIN_W, EV_SOLAR_EXIT_W); evJustFinished now has a
+//          5-poll cooldown (~2.5 min) before nudging Zaptec again instead
+//          of firing every cycle; session cut sends 5A (Zaptec minimum)
+//          instead of 0A since Zaptec ignores 0A on the current entity
+// v3.86 - EV v2.15: overload response based on current EV amps, not raw phase
+//          threshold; phase > 20A with EV at 8A+ → drop to 6A L1 (soft cut);
+//          phase > 20A with EV already at 6A → house caused overload → session
+//          cut (0A); removes EV_L1_GRADUATED_LIMIT — no longer needed
 // v3.85 - EV v2.14: graduated soft cut — phase load 20-22.5A drops to 8A
-//          3-phase instead of jumping straight to 6A L1; only drops to 6A L1
-//          when any phase exceeds 22.5A; prevents Zaptec ending session on
-//          large amp step-down from 12A to 6A
+//          3-phase instead of jumping straight to 6A L1
 // v3.84 - EV v2.13: force Zaptec write when connected_finished but evSoC < 100
-//          — prevents Zaptec staying in finished state when car is not full
 // v3.83 - EV v2.12: evShouldWrite gated on evCarConnected
-// v3.80 - EV v2.9: EV_RAMP_UP_POLLS raised 10 → 30 (~15 min at 30s polls per
-//          1A upscale step); prevents afternoon flapping by requiring 15 min
-//          of stable headroom before stepping up
-// v3.79 - EV v2.8: fix 8A/9A oscillation — phase headroom now adds back EV's
-//          own per-phase contribution so house load alone determines headroom,
-//          not house+EV combined; ramp counter resets to 0 when evSafeAmps
-//          drops below lastEvAmps so EV must earn full EV_RAMP_UP_POLLS
-//          (~5 min) of stable headroom before stepping back up
-// v3.78 - EV v2.7: night EV charging fully decoupled from battery state;
-//          battery discharging at night no longer caps EV — discharge adds
-//          grid headroom so full 10A ramp is allowed; battery charging at night
-//          caps EV at 8A to avoid competing; battery idle allows full 10A ramp
-// v3.77 - EV v2.6: when battery is discharging at night, EV is allowed up to
-//          8A 3-phase instead of being capped at 6A L1; battery compensates
-//          house load plus anything above 8A/phase; daytime discharge still
-//          caps EV at 6A L1 baseline
-// v3.76 - Hard stop fix: batterySoC >= 97% forces dc_amps to 0 just before
-//          output is sent — simple 5-line check after all decision logic,
-//          nothing can override it
+// v3.80 - EV v2.9: EV_RAMP_UP_POLLS raised 10 → 30 (~15 min at 30s polls)
+// v3.79 - EV v2.8: phase headroom add-back; ramp-down lock
+// v3.78 - EV v2.7: night discharge no longer caps EV
+// v3.77 - EV v2.6: night discharge cap raised to 8A 3-phase
+// v3.76 - Hard stop fix: batterySoC >= 97% forces dc_amps to 0
 // v3.75 - (superseded)
-// v3.74 - EV v2.5: daytime 3-phase up to 8A when isPriceVeryLow (price <=80%
-//          of avg AND <= chargeAbsMax) and phase headroom allows; uses same
-//          slow ramp (EV_RAMP_UP_POLLS) as night/zero-price charging so it
-//          won't jump straight to 8A — requires 5 min stable headroom per step
-// v3.73 - EV v2.4: slower upscale ramp — EV_RAMP_UP_POLLS raised from 4 to 10
-//          (~5 minutes at 30s polls before adding 1A when stepping 8→9→10A);
-//          ramp counter now only resets on l1SoftCut (actual EV-caused overload)
-//          instead of any overloadTriggered
-// v3.72 - EV v2.3: daytime 3-phase ramp only at price <= 0 (zero or negative)
-// v3.71 - EV v2.2: use raw DSMR phase amps directly — no add-back of EV amps
+// v3.74 - EV v2.5: daytime 3-phase up to 8A when isPriceVeryLow
+// v3.73 - EV v2.4: EV_RAMP_UP_POLLS raised 4 → 10
+// v3.72 - EV v2.3: daytime 3-phase ramp only at price <= 0
+// v3.71 - EV v2.2: raw DSMR phase amps, no add-back
 // v3.70 - EV v2.1: session cut only when house load alone >20A
-// v3.69 - evCarFull sends 0A instead of 5A
+// v3.69 - evCarFull sends 0A
 // v3.68 - smarter overload response
-// v3.67 - per-phase overload detection and EV phase add-back correction
-// v3.66 - per-phase overload detection: all 3 phases checked individually
 // v3.65 - blackout window 17h-19h set to 5A
 
-var EMS_VERSION = 'EMS v3.85';
-var EV_VERSION  = 'EV v2.14';
+var EMS_VERSION = 'EMS v3.90';
+var EV_VERSION  = 'EV v2.19';
 
 var CFG = {
   MAX_AMPS:             100,
@@ -70,9 +78,6 @@ var CFG = {
   MIN_DISCHARGE_A:      35,
   MIN_CHARGE_A:         10,
   SOLAR_SUPPRESS_DISCHARGE_W: 500,
-  EV_MAX_AMPS:          6,
-  EV_SOLAR_MIN_W:       4200,
-  EV_SOLAR_EXIT_W:      2400,
   EV_RATE_LIMIT_MS:     15 * 60 * 1000,
   EV_PUBLIC_RATE:       0.50
 };
@@ -90,8 +95,19 @@ var evChargingW   = (msg.EVChargeLoad !== undefined && msg.EVChargeLoad !== null
   ? parseFloat(msg.EVChargeLoad) || 0
   : lastEvAmps * CFG.GRID_VOLTAGE * 3;
 
-var evSoC         = parseFloat(msg.ev_soc) || 0;
-var evCarFull     = (zaptecMode === 'connected_finished') && evSoC >= 100;
+var evSoCRaw      = parseFloat(msg.ev_soc);
+var evSoCKnown    = !isNaN(evSoCRaw);
+var evSoC         = evSoCKnown ? evSoCRaw : 0;
+// ev_soc unavailable → trust Zaptec's connected_finished as full
+var evCarFull     = (zaptecMode === 'connected_finished') && (!evSoCKnown || evSoC >= 100);
+
+var evCarConnected = (
+  zaptecMode === 'connected_charging'   ||
+  zaptecMode === 'connected_finished'   ||
+  zaptecMode === 'connected_requesting' ||
+  zaptecMode === 'waiting'
+);
+var evDrawing      = zaptecMode === 'connected_charging' || evChargingW > 0;
 
 var phaseL1kW  = parseFloat(msg.phaseL1)   || 0;
 var phaseL2kW  = parseFloat(msg.phaseL2)   || 0;
@@ -115,21 +131,22 @@ var maxAllowedChargeA   = Math.min(CFG.MAX_AMPS, maxChargeFromGridA);
 
 var EV_3PHASE_MIN_A  = 7;
 
-var evPhaseContrib   = (lastEvAmps >= EV_3PHASE_MIN_A) ? lastEvAmps : 0;
-var homeL1W          = Math.max(0, phaseL1A - evPhaseContrib) * CFG.GRID_VOLTAGE;
-var homeL2W          = Math.max(0, phaseL2A - evPhaseContrib) * CFG.GRID_VOLTAGE;
-var homeL3W          = Math.max(0, phaseL3A - evPhaseContrib) * CFG.GRID_VOLTAGE;
+// EV draws on L1 in both modes; on L2/L3 only in 3-phase mode
+var evL1Contrib      = lastEvAmps;
+var evL23Contrib     = (lastEvAmps >= EV_3PHASE_MIN_A) ? lastEvAmps : 0;
+var homeL1W          = Math.max(0, phaseL1A - evL1Contrib)  * CFG.GRID_VOLTAGE;
+var homeL2W          = Math.max(0, phaseL2A - evL23Contrib) * CFG.GRID_VOLTAGE;
+var homeL3W          = Math.max(0, phaseL3A - evL23Contrib) * CFG.GRID_VOLTAGE;
 var homeImportW      = homeL1W + homeL2W + homeL3W;
 var dischargeTargetW = evChargingW > 0
-  ? Math.max(0, homeImportW)
-  : Math.max(0, gridImport * 1000 - evChargingW);
+  ? Math.max(0, homeImportW)         // EV charging: use house-only import
+  : Math.max(0, gridImport * 1000);  // no EV: full grid import is the target
 
 var negPriceHoursRemaining       = parseInt(msg.negPriceHoursRemaining)       || 1;
 var inPreDischargeWindow         = msg.inPreDischargeWindow === true;
 var inSolarPreDischargeWindow    = msg.inSolarPreDischargeWindow === true;
 var solarPreDischargeTargetSoC   = parseFloat(msg.solarPreDischargeTargetSoC) || 15;
 var kwhToFreeForSolar            = parseFloat(msg.kwhToFreeForSolar)           || 0;
-var kwhNeededForGrid             = parseFloat(msg.kwhNeededForGrid)            || 0;
 var hoursUntilNegWindow          = parseFloat(msg.hoursUntilNegWindow)         || 99;
 var futureNegHoursCount          = parseInt(msg.futureNegHoursCount)           || 0;
 
@@ -147,7 +164,6 @@ var isNegPrice  = currentPrice < 0;
 var chargeAbsMax    = avgPrice * CFG.CHARGE_ABS_RATIO;
 var dischargeAbsMin = avgPrice * CFG.DISCHARGE_ABS_RATIO;
 
-var chargeRatioThreshold    = lastState === 'charging'    ? CFG.CHARGE_THRESHOLD    + CFG.HYSTERESIS : CFG.CHARGE_THRESHOLD;
 var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;
 
 var isPriceLow;
@@ -195,7 +211,7 @@ if (isNegPrice && canCharge) {
   var solarForBatteryW = Math.max(0, solarTotalW - homeLoadW);
   var solarOffsetAmps  = Math.round(solarForBatteryW / CFG.BATTERY_VOLTAGE);
   var gridAmps         = Math.max(0, spreadAmps - solarOffsetAmps);
-  var negAmps          = Math.max(CFG.MIN_CHARGE_A, Math.min(maxAllowedChargeA, spreadAmps));
+  var negAmps          = Math.min(maxAllowedChargeA, Math.max(CFG.MIN_CHARGE_A, spreadAmps));  // grid headroom always wins
   charging   = true;
   targetAmps = negAmps;
   reason     = 'Negative price (' + currentPrice.toFixed(3) + ' EUR/kWh) - charging at ' + targetAmps + ' A'
@@ -285,9 +301,9 @@ if (isNegPrice && canCharge) {
 if (charging && discharging) { discharging = false; reason += ' [conflict resolved: charge wins]'; }
 if (targetAmps === 0) { charging = false; discharging = false; }
 
-context.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');
-
-var rawState = charging ? 'charging' : discharging ? 'discharging' : 'idle';
+// State this cycle's decision branch computed targetAmps for
+var decidedState = charging ? 'charging' : discharging ? 'discharging' : 'idle';
+var rawState = decidedState;
 if (rawState === 'discharging' && lastState === 'charging') { rawState = 'idle'; reason += ' [forced idle: charge → idle → discharge]'; }
 if (rawState === 'charging'    && lastState === 'discharging') { rawState = 'idle'; reason += ' [forced idle: discharge → idle → charge]'; }
 
@@ -297,7 +313,6 @@ if (rawState === pendingState) {
   context.set('pendingCount', newCount);
   if (newCount >= CONFIRM_CYCLES) {
     confirmedState = rawState;
-    context.set('lastState', rawState);
   } else {
     confirmedState = lastState;
     reason += ' [confirming ' + newCount + '/' + CONFIRM_CYCLES + ']';
@@ -309,6 +324,10 @@ if (rawState === pendingState) {
   reason += ' [pending change to ' + rawState + ' 1/' + CONFIRM_CYCLES + ']';
 }
 
+// Only apply targetAmps when the confirmed state is the one they were computed
+// for. While confirming or during a forced-idle transition, hold idle — never
+// apply charge amps as discharge amps or vice versa.
+if (confirmedState !== decidedState) { confirmedState = 'idle'; }
 charging    = confirmedState === 'charging';
 discharging = confirmedState === 'discharging';
 targetAmps  = (charging || discharging) ? targetAmps : 0;
@@ -324,6 +343,9 @@ if (batterySoC >= 97) {
   charging   = false;
   reason     = 'HARD STOP: SoC ' + batterySoC + '% >= 97% — charging blocked to protect battery';
 }
+
+// Persist the state actually sent to the inverter (after confirmation + hard stop)
+context.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');
 
 msg.payload = {
   version:     EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),
@@ -375,12 +397,19 @@ node.status({
   text:  batterySoC >= 97 ? 'HARD STOP SoC:' + batterySoC + '%' : EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
 });
 
-// ── EV Charge Controller v2.10 ────────────────────────────────────────────────
+// ── EV Charge Controller v2.19 ────────────────────────────────────────────────
 //
-// KEY CHANGES vs v2.9:
+// v2.17–v2.19 changes: see file header. Changes in v2.16 (vs v2.15):
 //
-// 1. NIGHT WINDOW EXPANDED TO 22:30–07:00
-//    Previously 23:00–06:00. Now starts at 22:30 using a minute check.
+// 1. Dead code removed: l1GraduatedCut, sixAmpResolves, overloadTriggered,
+//    EV_L1_OVERLOAD_CYCLES, EV_MAX_AMPS, EV_SOLAR_MIN_W, EV_SOLAR_EXIT_W
+//
+// 2. evJustFinished has a 5-poll cooldown (~2.5 min) before nudging Zaptec
+//    again instead of firing every cycle — prevents harassing Zaptec into
+//    dropping a legitimately finished session
+//
+// 3. Session cut sends 5A (Zaptec minimum) instead of 0A — Zaptec ignores
+//    0A on the current entity; use the switch node for a true pause
 
 var currentHour = new Date().getHours();
 var currentMin  = new Date().getMinutes();
@@ -399,17 +428,18 @@ var evInNight    = (currentHour > EV_NIGHT_START || (currentHour === EV_NIGHT_ST
 var EV_MIN_AMPS           = 6;
 var EV_NIGHT_MAX          = 12;
 var EV_NIGHT_MIN          = 8;
-var EV_L1_HARD_LIMIT      = 20;    // above this → graduated response
-var EV_L1_GRADUATED_LIMIT = 22.5;  // above this → full soft cut to 6A L1
+var EV_L1_HARD_LIMIT      = 20;
 var EV_L1_WARN_LIMIT      = 18;
-var EV_L1_OVERLOAD_CYCLES = 3;
 var EV_CUT_COOLDOWN_POLLS = 10;
-var EV_RAMP_UP_POLLS      = 30;  // ~15 min at 30s polls per 1A step
+var EV_RAMP_UP_POLLS      = 30;   // ~15 min at 30s polls per 1A step
+var EV_FINISHED_COOLDOWN  = 5;    // polls between Zaptec nudges when connected_finished early
+var EV_FINISHED_MAX_NUDGES = 3;   // stop nudging after this — car may have its own charge limit
 
 // ── Retrieve EV persistent state ─────────────────────────────────────────────
-var evCutCooldown    = context.get('evCutCooldown')    || 0;
-var evRampClearCount = context.get('evRampClearCount') || 0;
-var l1OverloadCount  = context.get('l1OverloadCount')  || 0;
+var evCutCooldown      = context.get('evCutCooldown')      || 0;
+var evRampClearCount   = context.get('evRampClearCount')   || 0;
+var l1OverloadCount    = context.get('l1OverloadCount')    || 0;
+var evFinishedCooldown = context.get('evFinishedCooldown') || 0;
 
 // ── Battery charge hold-down ──────────────────────────────────────────────────
 var EV_CHARGE_HOLDDOWN_CYCLES = 4;
@@ -436,23 +466,13 @@ var phaseL2LoadA = (phaseL2kW * 1000) / CFG.GRID_VOLTAGE;
 var phaseL3LoadA = (phaseL3kW * 1000) / CFG.GRID_VOLTAGE;
 
 // ── Overload detection ────────────────────────────────────────────────────────
-// Graduated response:
-//   phase 20–22.5A → moderate overload → drop to 8A 3-phase (l1GraduatedCut)
-//   phase > 22.5A  → hard overload     → drop to 6A L1 (l1SoftCut/l1SessionCut)
-var maxPhaseLoad     = Math.max(phaseL1LoadA, phaseL2LoadA, phaseL3LoadA);
-var anyOver20        = maxPhaseLoad > EV_L1_HARD_LIMIT;
-var anyOverGraduated = maxPhaseLoad > EV_L1_GRADUATED_LIMIT;
-
-var projL1At6A = phaseL1LoadA - (lastEvAmps - 6);
-var projL2At6A = evIn3Phase ? phaseL2LoadA - lastEvAmps : phaseL2LoadA;
-var projL3At6A = evIn3Phase ? phaseL3LoadA - lastEvAmps : phaseL3LoadA;
-var sixAmpResolves = projL1At6A <= EV_L1_HARD_LIMIT &&
-                     projL2At6A <= EV_L1_HARD_LIMIT &&
-                     projL3At6A <= EV_L1_HARD_LIMIT;
-
-var l1GraduatedCut = anyOver20 && !anyOverGraduated;          // 20–22.5A: drop to 8A 3-phase
-var l1SoftCut      = anyOverGraduated &&  sixAmpResolves;     // >22.5A, 6A resolves: drop to 6A L1
-var l1SessionCut   = anyOverGraduated && !sixAmpResolves;     // >22.5A, 6A doesn't help: session cut
+// Response based on current EV amps:
+//   phase > 20A AND EV at 8A+ → soft cut: drop to 6A L1, keep session alive
+//   phase > 20A AND EV at 6A  → house caused overload → session cut: 5A
+var maxPhaseLoad = Math.max(phaseL1LoadA, phaseL2LoadA, phaseL3LoadA);
+var anyOver20    = maxPhaseLoad > EV_L1_HARD_LIMIT;
+var l1SoftCut    = evCarConnected && anyOver20 && lastEvAmps > EV_MIN_AMPS;
+var l1SessionCut = evCarConnected && anyOver20 && lastEvAmps <= EV_MIN_AMPS;
 
 var anyWarnOverload = !anyOver20 && (
                       phaseL1LoadA > EV_L1_WARN_LIMIT ||
@@ -460,8 +480,6 @@ var anyWarnOverload = !anyOver20 && (
                       phaseL3LoadA > EV_L1_WARN_LIMIT);
 if (anyWarnOverload) { l1OverloadCount++; } else { l1OverloadCount = 0; }
 context.set('l1OverloadCount', l1OverloadCount);
-
-var overloadTriggered = anyOver20;
 
 // ── Post-cut cooldown and ramp counter update ─────────────────────────────────
 var inCutCooldown = evCutCooldown > 0;
@@ -472,8 +490,8 @@ if (l1SessionCut) {
 } else if (inCutCooldown) {
   evCutCooldown--;
   evRampClearCount = 0;
-} else if (l1SoftCut || l1GraduatedCut) {
-  evRampClearCount = 0;
+} else if (l1SoftCut || !evCarConnected) {
+  evRampClearCount = 0;   // also: no accumulation while no car is connected
 } else {
   evRampClearCount++;
 }
@@ -481,12 +499,14 @@ context.set('evCutCooldown',    evCutCooldown);
 context.set('evRampClearCount', evRampClearCount);
 
 // ── Phase headroom ─────────────────────────────────────────────────────────────
-// Add back EV's own per-phase contribution so headroom reflects house load
-// only — not house+EV combined.
-var evContribPerPhase = evIn3Phase ? lastEvAmps : 0;
-var l1HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL1LoadA + evContribPerPhase);
-var l2HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL2LoadA + evContribPerPhase);
-var l3HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL3LoadA + evContribPerPhase);
+// Add back EV's own per-phase contribution so headroom reflects house load only.
+// Only credit EV current that is actually flowing — crediting lastEvAmps while
+// the EV is paused/finished overstates headroom and can overload on resume.
+var evAddBackL1  = evDrawing ? lastEvAmps : 0;                  // EV is on L1 in both modes
+var evAddBackL23 = (evDrawing && evIn3Phase) ? lastEvAmps : 0;  // L2/L3 only in 3-phase
+var l1HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL1LoadA + evAddBackL1);
+var l2HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL2LoadA + evAddBackL23);
+var l3HeadroomA  = Math.max(0, EV_L1_HARD_LIMIT - phaseL3LoadA + evAddBackL23);
 var worst3PhaseA = Math.min(l1HeadroomA, l2HeadroomA, l3HeadroomA);
 
 // ── Phase mode hysteresis ─────────────────────────────────────────────────────
@@ -515,36 +535,33 @@ var evPhaseMode;
 var evCanCharge;
 
 if (l1SessionCut || inCutCooldown) {
-  evSafeAmps  = EV_MIN_AMPS;
+  // House load caused overload — set to Zaptec minimum (5A) to keep session alive
+  // but signal via switch node to actually pause charging
+  evSafeAmps  = 5;
   evPhaseMode = 'single-phase-L1';
-  evCanCharge = true;
+  evCanCharge = false;
 
 } else if (l1SoftCut) {
+  // EV at 8A+ caused overload — drop to 6A L1, keep session alive
   evSafeAmps  = EV_MIN_AMPS;
   evPhaseMode = 'single-phase-L1';
-  evCanCharge = true;
-
-} else if (l1GraduatedCut) {
-  // 20–22.5A: moderate overload — drop to 8A 3-phase, keep session alive
-  evSafeAmps  = EV_NIGHT_MIN;  // 8A
-  evPhaseMode = '3-phase';
   evCanCharge = true;
 
 } else if (allow3Phase) {
   var maxAllowed;
   if (evInNight) {
     var rampBase  = Math.max(EV_MIN_AMPS, lastEvAmps);
-    var rampBonus = Math.floor(evRampClearCount / EV_RAMP_UP_POLLS);
+    var rampBonus = evRampClearCount >= EV_RAMP_UP_POLLS ? 1 : 0;   // max +1A per earned window
     maxAllowed    = Math.min(EV_NIGHT_MAX, rampBase + rampBonus);
   } else if (charging || evInHoldDown) {
     maxAllowed = EV_MIN_AMPS;
   } else if (!charging && currentPrice <= 0) {
     var rampBase2  = Math.max(EV_MIN_AMPS, lastEvAmps);
-    var rampBonus2 = Math.floor(evRampClearCount / EV_RAMP_UP_POLLS);
+    var rampBonus2 = evRampClearCount >= EV_RAMP_UP_POLLS ? 1 : 0;
     maxAllowed     = Math.min(EV_NIGHT_MAX, rampBase2 + rampBonus2);
   } else if (!charging && isPriceVeryLow) {
     var rampBase3  = Math.max(EV_MIN_AMPS, lastEvAmps);
-    var rampBonus3 = Math.floor(evRampClearCount / EV_RAMP_UP_POLLS);
+    var rampBonus3 = evRampClearCount >= EV_RAMP_UP_POLLS ? 1 : 0;
     maxAllowed     = Math.min(8, rampBase3 + rampBonus3);
   } else if (hasSolarSurplus && solarSurplusPerPhaseA >= EV_3PHASE_MIN_A) {
     maxAllowed = Math.min(16, solarSurplusPerPhaseA + evCurrentPerPhase);
@@ -569,8 +586,10 @@ if (l1SessionCut || inCutCooldown) {
 
 } else {
   if (hasSolarSurplus && solarSurplusL1A + evCurrentPerPhase > EV_MIN_AMPS && !evInNight) {
-    evSafeAmps = Math.min(EV_3PHASE_MIN_A - 1, solarSurplusL1A + evCurrentPerPhase);
-    evSafeAmps = Math.max(EV_MIN_AMPS, evSafeAmps);
+    evSafeAmps  = Math.min(EV_3PHASE_MIN_A - 1, solarSurplusL1A + evCurrentPerPhase);
+    evSafeAmps  = Math.max(EV_MIN_AMPS, evSafeAmps);
+    evPhaseMode = 'single-phase-L1';  // no 3-phase headroom — solar on L1 only
+    evCanCharge = true;
   } else if (evInNight) {
     evSafeAmps  = EV_NIGHT_MIN;
     evPhaseMode = '3-phase';
@@ -592,12 +611,7 @@ if (evSafeAmps < lastEvAmps) {
 var evLastWriteTime = context.get('evLastWriteTime') || 0;
 var evTimeSince     = new Date().getTime() - evLastWriteTime;
 
-var evCarConnected = (
-  zaptecMode === 'connected_charging'   ||
-  zaptecMode === 'connected_finished'   ||
-  zaptecMode === 'connected_requesting' ||
-  zaptecMode === 'waiting'
-);
+// evCarConnected / evDrawing are defined at the top of the script
 
 // ── EV Decision ───────────────────────────────────────────────────────────────
 var evTargetAmps = 0;
@@ -619,25 +633,19 @@ if (!evCarConnected) {
   evRampClearCount = 0;
   context.set('evCutCooldown',    evCutCooldown);
   context.set('evRampClearCount', evRampClearCount);
-  evReason = 'Phase overload — ' + maxPhaseLoad.toFixed(1)
-           + 'A > 22.5A, 6A does not resolve — session cut 5A, cooldown ' + EV_CUT_COOLDOWN_POLLS + ' polls';
+  evReason = 'Phase overload (' + maxPhaseLoad.toFixed(1)
+           + 'A > 20A) — EV at 6A, house caused overload — EV to min 5A, cooldown ' + EV_CUT_COOLDOWN_POLLS + ' polls';
 
 } else if (inCutCooldown) {
-  evTargetAmps = EV_MIN_AMPS;
+  evTargetAmps = 5;
   evPhaseMode  = 'single-phase-L1';
-  evReason     = 'Post-cut cooldown (' + evCutCooldown + ' polls remaining) — holding 6A [L1]';
+  evReason     = 'Post-cut cooldown (' + evCutCooldown + ' polls remaining) — EV at min 5A';
 
 } else if (l1SoftCut) {
   evTargetAmps = EV_MIN_AMPS;
   evPhaseMode  = 'single-phase-L1';
   evReason     = 'Phase overload (' + maxPhaseLoad.toFixed(1)
-               + 'A > 22.5A) — EV caused it, house fine — capped 6A [L1], session kept alive';
-
-} else if (l1GraduatedCut) {
-  evTargetAmps = EV_NIGHT_MIN;  // 8A
-  evPhaseMode  = '3-phase';
-  evReason     = 'Phase overload (' + maxPhaseLoad.toFixed(1)
-               + 'A, 20–22.5A range) — graduated cut to 8A [3-phase], session kept alive';
+               + 'A > 20A) — EV at ' + lastEvAmps + 'A caused it — dropped to 6A [L1], session kept alive';
 
 } else if (evInBlackout) {
   evTargetAmps = 5;
@@ -680,6 +688,13 @@ if (!evCarConnected) {
   }
 }
 
+// ── Step-up lock ──────────────────────────────────────────────────────────────
+// Every 1A increase must be earned with a fresh EV_RAMP_UP_POLLS window (~15 min)
+if (evCarConnected && evTargetAmps > lastEvAmps) {
+  evRampClearCount = 0;
+  context.set('evRampClearCount', evRampClearCount);
+}
+
 // ── EV Session accumulator ────────────────────────────────────────────────────
 var evLastCycleTime = context.get('evLastCycleTime') || 0;
 var evNowMs         = new Date().getTime();
@@ -688,11 +703,13 @@ context.set('evLastCycleTime', evNowMs);
 
 var evWasConnected = context.get('evWasConnected') || false;
 if (!evCarConnected && evWasConnected) {
-  context.set('evSessionKwh',     0);
-  context.set('evSessionCostAct', 0);
-  context.set('evSessionCostPub', 0);
-  context.set('evCutCooldown',    0);
-  context.set('evRampClearCount', 0);
+  context.set('evSessionKwh',       0);
+  context.set('evSessionCostAct',   0);
+  context.set('evSessionCostPub',   0);
+  context.set('evCutCooldown',      0);
+  context.set('evRampClearCount',   0);
+  context.set('evFinishedCooldown', 0);
+  context.set('evLastAmps',         0);  // reset so first write on new session always fires
 }
 context.set('evWasConnected', evCarConnected);
 
@@ -718,11 +735,26 @@ var evInstantSaving  = evInstantCostPub - evInstantCostAct;
 var evSessionSaving  = evSessionCostPub - evSessionCostAct;
 
 // ── Rate limit ────────────────────────────────────────────────────────────────
-// evJustFinished: Zaptec in connected_finished but car not full — force write
-// every cycle to nudge Zaptec back into charging state.
-// evShouldWrite: fires on amp change, every 15 min, or when Zaptec finished early
-// evShouldWriteZaptec: same but only when car is connected — gates Zaptec API
-var evJustFinished      = evCarConnected && zaptecMode === 'connected_finished' && evSoC < 100;
+// evJustFinished: Zaptec in connected_finished but car not full.
+// Uses a cooldown (EV_FINISHED_COOLDOWN polls) to avoid hammering the API —
+// nudges Zaptec every ~2.5 min instead of every 30s.
+var evJustFinished = false;
+var evFinishedNudges = context.get('evFinishedNudges') || 0;
+if (evCarConnected && zaptecMode === 'connected_finished' && evSoCKnown && evSoC < 100) {
+  if (evFinishedNudges < EV_FINISHED_MAX_NUDGES && evFinishedCooldown <= 0) {
+    evJustFinished = true;
+    evFinishedNudges++;
+    evFinishedCooldown = EV_FINISHED_COOLDOWN;
+  } else if (evFinishedCooldown > 0) {
+    evFinishedCooldown--;
+  }
+} else {
+  evFinishedCooldown = 0;
+  evFinishedNudges   = 0;   // reset once Zaptec leaves connected_finished
+}
+context.set('evFinishedCooldown', evFinishedCooldown);
+context.set('evFinishedNudges',   evFinishedNudges);
+
 var evShouldWrite       = (evTargetAmps !== lastEvAmps) || (evTimeSince >= CFG.EV_RATE_LIMIT_MS) || evJustFinished;
 var evShouldWriteZaptec = evCarConnected && evShouldWrite;
 if (evShouldWrite) {
@@ -758,13 +790,10 @@ var evMsg = {
       phaseL1LoadA:          parseFloat(phaseL1LoadA.toFixed(2)),
       phaseL2LoadA:          parseFloat(phaseL2LoadA.toFixed(2)),
       phaseL3LoadA:          parseFloat(phaseL3LoadA.toFixed(2)),
-      projL1At6A:            parseFloat(projL1At6A.toFixed(2)),
-      projL2At6A:            parseFloat(projL2At6A.toFixed(2)),
-      projL3At6A:            parseFloat(projL3At6A.toFixed(2)),
       anyOver20:             anyOver20,
-      anyOverGraduated:      anyOverGraduated,
-      sixAmpResolves:        sixAmpResolves,
-      l1GraduatedCut:        l1GraduatedCut,
+      l1HardOverload:        anyOver20,
+      l1WarnOverload:        anyWarnOverload,
+      evDrawing:             evDrawing,
       l1HeadroomA:           parseFloat(l1HeadroomA.toFixed(1)),
       l2HeadroomA:           parseFloat(l2HeadroomA.toFixed(1)),
       l3HeadroomA:           parseFloat(l3HeadroomA.toFixed(1)),
@@ -775,6 +804,9 @@ var evMsg = {
       inCutCooldown:         inCutCooldown,
       evCutCooldown:         evCutCooldown,
       evRampClearCount:      evRampClearCount,
+      evJustFinished:        evJustFinished,
+      evFinishedCooldown:    evFinishedCooldown,
+      evFinishedNudges:      evFinishedNudges,
       evInHoldDown:          evInHoldDown,
       holdDownCount:         holdDownCount,
       phaseDropCount:        phaseDropCount,
