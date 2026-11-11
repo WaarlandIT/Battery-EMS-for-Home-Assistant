@@ -1,4 +1,6 @@
-// EMS Combined Logger v1.3
+// EMS Combined Logger v1.4
+// Changes from v1.3:
+//   - Added shouldWrite to EV log output so Zaptec API write activity is visible
 // Changes from v1.1:
 //   - function declarations replaced with var expressions (Node-RED sandbox fix)
 // Changes from v1.0:
@@ -6,7 +8,7 @@
 //   - Battery deduplication: only logs when state, SoC or amps changes
 //   - Daily log rotation uses local date (midnight Amsterdam, not UTC)
 
-var LOGGER_VERSION = 'Logger v1.3';
+var LOGGER_VERSION = 'Logger v1.4';
 
 // ── CET/CEST timestamp ────────────────────────────────────────────────────────
 var getLastSunday = function(y, m) {
@@ -131,12 +133,13 @@ if (msg.payload && msg.payload.dc_amps !== undefined) {
          + '  perPhase=' + (ei.solarSurplusPerPhaseA||0) + 'A\n'
          + '  Price:    ' + (ei.currentPrice||0).toFixed(3) + ' EUR'
          + '  |  hour: ' + (ei.currentHour||0) + 'h'
-         + '  |  lastEvAmps: ' + (ei.lastEvAmps||0) + 'A\n';
+         + '  |  lastEvAmps: ' + (ei.lastEvAmps||0) + 'A'
+         + '  |  shouldWrite: ' + (e.shouldWrite||false) + '\n';
 
 } else {
     return null;
 }
 
 msg.payload  = line;
-msg.filename = '/share/ems_log_' + date + '.txt';
+msg.filename = '/media/logs/ems_log_' + date + '.txt';
 return msg;
