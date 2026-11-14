@@ -1,4 +1,10 @@
-// EMS Combined Logger v1.4
+// EMS Combined Logger v1.5
+// Changes from v1.4:
+//   - Battery deduplication also looks at the discharge power (in 500 W steps) —
+//     dc_amps is 0 while discharging, so discharge changes were never logged
+//   - EV deduplication ignores the numbers inside the reason text (ramp counter,
+//     headroom, hold countdown) — they changed every poll, so every poll was logged
+//   - A price or threshold of exactly 0 is printed as 0, not as '?'
 // Changes from v1.3:
 //   - Added shouldWrite to EV log output so Zaptec API write activity is visible
 // Changes from v1.1:
@@ -8,7 +14,7 @@
 //   - Battery deduplication: only logs when state, SoC or amps changes
 //   - Daily log rotation uses local date (midnight Amsterdam, not UTC)
 
-var LOGGER_VERSION = 'Logger v1.4';
+var LOGGER_VERSION = 'Logger v1.5';
 
 // ── CET/CEST timestamp ────────────────────────────────────────────────────────
 var getLastSunday = function(y, m) {
@@ -19,6 +25,7 @@ var getLastSunday = function(y, m) {
     return d.getTime();
 };
 var pad = function(n) { return String(n).padStart(2, '0'); };
+var orQ = function(v) { return (v === null || v === undefined || v === '') ? '?' : v; };
 
 var now      = new Date();
 var utcMs    = now.getTime();
@@ -51,9 +58,11 @@ if (msg.payload && msg.payload.dc_amps !== undefined) {
     var i = p.inputs || {};
     var pl = p.planner || {};
 
-    // Deduplication — only log when state, SoC or amps changes
+    // Deduplication — only log when state, SoC, charge amps or discharge power
+    // (500 W steps) changes
     var battKey = (p.charging ? 'CHG' : p.discharging ? 'DCH' : 'IDLE')
                 + '|' + p.dc_amps
+                + '|' + Math.round((p.dc_power || 0) / 500)
                 + '|' + i.batterySoC;
     var lastBattKey = context.get('lastBattKey') || '';
     if (battKey === lastBattKey) return null;
@@ -85,22 +94,23 @@ if (msg.payload && msg.payload.dc_amps !== undefined) {
          + '  ── Planner ──\n'
          + '  inWindow: ' + pl.inWindow
          + '  |  inDischargeWindow: ' + pl.inDischargeWindow
-         + '  |  cheapestPrice: ' + (pl.cheapestPrice||'?') + ' EUR\n'
+         + '  |  cheapestPrice: ' + orQ(pl.cheapestPrice) + ' EUR\n'
          + '  chargeHours: [' + (pl.plannedHours||[]).join('h, ') + (pl.plannedHours&&pl.plannedHours.length ? 'h' : '') + ']'
          + '  |  dischargeHours: [' + (pl.plannedDischargeHours||[]).join('h, ') + (pl.plannedDischargeHours&&pl.plannedDischargeHours.length ? 'h' : '') + ']\n'
          + '  kwhNeeded: ' + (pl.kwhNeeded||0) + ' kWh'
-         + '  |  threshold: ' + (pl.dischargeThreshold||'?') + ' EUR\n';
+         + '  |  threshold: ' + orQ(pl.dischargeThreshold) + ' EUR\n';
 
 } else if (msg.payload && msg.payload.targetAmps !== undefined) {
     // ── EV message (EMS output 2) ─────────────────────────────────────────────
     var e = msg.payload;
     var ei = e.inputs || {};
 
-    // Deduplication — only log when state, amps, phase mode or reason changes
+    // Deduplication — only log when state, amps, phase mode or the kind of reason
+    // changes. Numbers in the reason text are ignored: they move on every poll.
     var evKey = (e.evCharging ? 'ON' : 'OFF')
               + '|' + e.targetAmps
               + '|' + (ei.evPhaseMode||'')
-              + '|' + e.reason;
+              + '|' + String(e.reason || '').replace(/-?\d+(\.\d+)?/g, '#');
     var lastEvKey = context.get('lastEvKey') || '';
     if (evKey === lastEvKey) return null;
     context.set('lastEvKey', evKey);
