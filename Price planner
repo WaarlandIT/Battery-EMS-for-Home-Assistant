@@ -1,4 +1,28 @@
 // Price Planner
+// v2.16 - fixes from the second code review —
+//          (1) charge window is planned over the current price valley: from now
+//              until the first above-average hour that follows a below-average
+//              hour, continuing into tomorrow's prices when they are published.
+//              The night valley is no longer split at midnight (no more
+//              charging at 23h when 03h is cheaper) and a late-evening cheap
+//              hour no longer makes the planner skip a midday dip
+//          (2) pre-discharge before negative prices is limited to what the
+//              negative window can refill (hours x max charge rate) — it used
+//              to empty the battery to 15% for a single negative hour. The
+//              stop level is passed to the EMS as msg.preDischargeTargetSoC
+//          (3) solar pre-discharge has a fixed target SoC (room for the expected
+//              solar + 3 kWh of cheap grid charging) and is latched until that
+//              level is reached — the target used to move down with the SoC and
+//              the discharge stopped as soon as the overfill flag cleared
+//          (4) no fake average: when today's prices are missing, msg.avgPrice is
+//              the last average calculated today, or null — it used to be 0.10
+//              (or, in the flow, the current price itself)
+//          (5) quarter-hour price arrays are averaged to hourly values first;
+//              msg.currentPrice is the exact slot that contains "now"
+//          (6) the current negative hour counts only for the part that is left
+//          (7) msg.solarNow is optional: without it the planner uses the solar
+//              production the EMS stored on its previous run (flow context)
+//          (8) SoC 0% is no longer read as "unknown"
 // v2.15 - bug fixes from simulation review —
 //          (1) crash (whole flow stops, EMS never runs) when the price array has
 //              no remaining hours for today; now falls back like "no prices"
@@ -16,8 +40,7 @@
 //              correct for both local-offset and UTC ('Z') timestamps
 // v2.14 - solar overfill pre-discharge: if solar forecast will fill the battery
 //          before the cheap window opens, discharge now to make room for cheap grid charging
-// v2.13 - discharge window centered on most expensive hour and expanded outward;
-//          window size based on actual kWh available to discharge at max rate
+// v2.13 - discharge window centered on most expensive hour and expanded outward
 // v2.12 - charge window only built when cheapestPrice <= chargePriceCap;
 //          prevents building a window around expensive hours at night
 // v2.11 - pre-discharge before upcoming negative price windows;
@@ -38,53 +61,73 @@
 // v2.1 - fixed msg.plannerVersion, DISCHARGE_ABS_MIN corrected
 // v2.0 - dischargeThreshold recalculated after conflict filter
 
-var PLANNER_VERSION      = 'v2.15';
+var PLANNER_VERSION      = 'v2.16';
 var BATTERY_KWH          = 40;
 var BATTERY_VOLTAGE      = 48;
-var MAX_AMPS             = 100;   // v2.15: was 200 — must match EMS CFG.MAX_AMPS
+var MAX_AMPS             = 100;   // must match EMS CFG.MAX_AMPS
 var ROUND_TRIP_EFF       = 0.85;
 var SOC_MIN              = 10;
 var SOC_MAX              = 95;
 var SAFETY_BUFFER_H      = 1;
 var SOC_NORMAL_THRESHOLD = 80;    // above this, use tight charge cap
-var CHARGE_ABS_RATIO     = 0.55;  // tight cap = avg * this (mirrors EMS v3.4)
-var DISCHARGE_ABS_RATIO  = 0.55;  // min discharge price = avg * this (mirrors EMS v3.4)
+var CHARGE_ABS_RATIO     = 0.55;  // tight cap = avg * this (mirrors EMS)
+var DISCHARGE_ABS_RATIO  = 0.55;  // min discharge price = avg * this (mirrors EMS)
 var SOLAR_FORECAST_EFF   = 0.90;  // how much of the solar forecast actually reaches the battery
 var EARLY_BIAS_EUR       = 0.02;  // prefer earlier hour when price difference is within this margin
 var LATE_BIAS_EUR        = 0.02;  // prefer later hour when discharge neighbour prices are within this margin
-var MAX_DISCHARGE_KW     = MAX_AMPS * BATTERY_VOLTAGE / 1000;   // v2.15: derived (4.8 kW), was hardcoded 9.6
+var MAX_DISCHARGE_KW     = MAX_AMPS * BATTERY_VOLTAGE / 1000;
 var SOLAR_OVERFILL_RATIO = 1.0;   // solar usable / headroom ratio above which overfill is expected
 var SOLAR_PRE_MIN_HOURS  = 1;     // minimum hours before cheap window needed for pre-discharge
-// Note: solarNow_W requires msg.solarNow to be set in the Node-RED chain
-// Add a function node before Price Planner: msg.solarNow = msg.pac1 + msg.pac2 + msg.pac3
-var SOC_DISCHARGE_MAX    = 95;    // SoC from which discharge starts
+var SOC_DISCHARGE_MAX    = 95;    // SoC the discharge window is sized for (a full battery)
 var SOC_DISCHARGE_MIN_PL = 15;    // SoC floor for discharge
+var MIN_GRID_CHEAP_KWH   = 3.0;   // room to always keep for grid charging at the cheapest price
+var SOLAR_NOW_MAX_AGE_MS = 5 * 60 * 1000;   // how old the EMS-stored solar value may be
+var MAX_HORIZON_SLOTS    = 24;    // charge window never looks further than 24 h ahead
 
 var maxChargeKw = (MAX_AMPS * BATTERY_VOLTAGE / 1000) * ROUND_TRIP_EFF;
 
-var batterySoC  = parseFloat(msg.batterySoC) || parseFloat(context.get('lastSoC')) || 50;
-context.set('lastSoC', batterySoC);
-var solarNow_W  = parseFloat(msg.solarNow) || 0;  // current solar production in W (from EMS chain)
+var now   = new Date();
+var nowMs = now.getTime();
 
-// Solar forecast — kWh still expected today from Forecast.Solar integration
-// Entity: sensor.energy_production_remaining_today (kWh)
-// Falls back to 0 if sensor is unavailable so planner remains conservative
+var pad2      = function(n) { return String(n).padStart(2, '0'); };
+var dateKeyOf = function(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); };
+var localDateStr = dateKeyOf(now);
+var currentHour  = now.getHours();
+
+// ── Battery SoC ───────────────────────────────────────────────────────────────
+// Unknown SoC: use the last known value, else 50% — for planning only. The EMS
+// has its own check and keeps the battery idle when the SoC is really unknown.
+var socRaw  = parseFloat(msg.batterySoC);
+var lastSoC = parseFloat(context.get('lastSoC'));
+var batterySoC = !isNaN(socRaw) ? socRaw : (!isNaN(lastSoC) ? lastSoC : 50);
+if (!isNaN(socRaw)) { context.set('lastSoC', socRaw); }
+
+// ── Current solar production (W) ──────────────────────────────────────────────
+// msg.solarNow when a "Set solarNow" node is in the chain; otherwise the value
+// the EMS Decision Engine stored on its previous run (at most a few seconds old).
+var solarNow_W = parseFloat(msg.solarNow);
+if (isNaN(solarNow_W)) {
+  solarNow_W = 0;
+  if (typeof flow !== 'undefined') {
+    var storedSolarW  = parseFloat(flow.get('emsSolarNowW'));
+    var storedSolarTs = parseFloat(flow.get('emsSolarNowTs'));
+    if (!isNaN(storedSolarW) && !isNaN(storedSolarTs) && (nowMs - storedSolarTs) <= SOLAR_NOW_MAX_AGE_MS) {
+      solarNow_W = storedSolarW;
+    }
+  }
+}
+
+// Solar forecast — kWh still expected today (Forecast.Solar); 0 when unavailable
 var solarForecastKwh = parseFloat(msg.solarForecastRemaining) || 0;
-var solarUsableKwh   = solarForecastKwh * SOLAR_FORECAST_EFF;  // apply efficiency loss
+var solarUsableKwh   = solarForecastKwh * SOLAR_FORECAST_EFF;
 
 var usableCapacity = BATTERY_KWH * ((SOC_MAX - SOC_MIN) / 100);
 var currentKwh     = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);
 var kwhNeeded      = Math.max(0, usableCapacity - currentKwh);
 
-// For grid charge planning, only deduct solar that arrives AFTER the cheap window.
-// Solar arriving before the cheap window fills the battery independently — it
-// cannot be relied upon to leave room for cheap grid charging.
-// We estimate solar timing linearly: cheapWindowStartOffset / totalRemainingHours × total.
-// At this point we don't know the cheap window yet, so use a two-pass approach:
-// First pass uses total solar for a rough hoursNeeded, second pass (after window is known)
-// recalculates with solar-after-window. For now use total solar as conservative estimate.
-var kwhFromGrid    = Math.max(0, kwhNeeded - solarUsableKwh);  // solar covers part; grid covers rest
-var hoursNeeded    = Math.ceil(kwhFromGrid / maxChargeKw) + SAFETY_BUFFER_H;
+// First estimate, refined below once the cheap window is known
+var kwhFromGrid = Math.max(0, kwhNeeded - solarUsableKwh);
+var hoursNeeded = Math.ceil(kwhFromGrid / maxChargeKw) + SAFETY_BUFFER_H;
 
 // Accept Frank Energie price array in either format
 var prices = null;
@@ -95,6 +138,13 @@ if (Array.isArray(msg.frankPrices)) {
 }
 
 var setFallback = function(reason) {
+  // Average: only a real one. The last average calculated today, else null —
+  // the EMS switches its price-ratio rules off when the average is unknown.
+  var lastAvg     = parseFloat(context.get('lastAvgPrice'));
+  var lastAvgDate = context.get('lastAvgDate');
+  msg.avgPrice = (!isNaN(lastAvg) && lastAvgDate === localDateStr) ? String(lastAvg) : null;
+  context.set('solarPreActive', false);
+
   msg.plannerVersion             = PLANNER_VERSION;
   msg.inChargingWindow           = null;
   msg.inDischargeWindow          = null;
@@ -110,6 +160,7 @@ var setFallback = function(reason) {
   msg.negPriceHoursRemaining     = 0;
   msg.inPreDischargeWindow       = false;
   msg.preDischargeHours          = [];
+  msg.preDischargeTargetSoC      = SOC_DISCHARGE_MIN_PL;
   msg.hoursUntilNegWindow        = null;
   msg.futureNegHoursCount        = 0;
   msg.inSolarPreDischargeWindow  = false;
@@ -128,43 +179,73 @@ if (!prices || prices.length === 0) {
   return msg;
 }
 
-var now         = new Date();
-var currentHour = now.getHours();
-
-// Determine local date string for today's prices
-var localOffset  = now.getTimezoneOffset() * 60000;
-var localNow     = new Date(now.getTime() - localOffset);
-var localDateStr = localNow.toISOString().substring(0, 10);
-
-// Parse all prices and calculate avg + current from the array directly
-var allParsed    = [];
-var totalPrice   = 0;
-var todayCount   = 0;
+// ── Parse the price array ─────────────────────────────────────────────────────
+// Every valid entry is put in its local hour. Several entries in one hour
+// (quarter-hour prices) are averaged, so the rest of the planner always works
+// with one price per hour. The exact entry that contains "now" gives
+// msg.currentPrice.
+var hourMap   = {};
+var hourSlots = [];
 var currentPriceCalc = null;
 
 for (var i = 0; i < prices.length; i++) {
-  var p        = prices[i];
+  var p = prices[i];
+  if (!p) continue;
   var fromDate = new Date(p.from);
   var tillDate = new Date(p.till);
-  // v2.15: derive local hour/date from the parsed timestamp, not the string —
-  // correct whether Frank returns local-offset or UTC ('Z') timestamps
-  var localHour = fromDate.getHours();
-  var dateStr   = fromDate.getFullYear() + '-' + String(fromDate.getMonth() + 1).padStart(2, '0')
-                + '-' + String(fromDate.getDate()).padStart(2, '0');
-  allParsed.push({ from: fromDate, till: tillDate, price: parseFloat(p.price), localHour: localHour, dateStr: dateStr });
+  var priceVal = parseFloat(p.price);
+  if (isNaN(fromDate.getTime()) || isNaN(tillDate.getTime()) || isNaN(priceVal)) continue;
 
-  if (dateStr === localDateStr) {
-    totalPrice += parseFloat(p.price);
-    todayCount++;
-    if (localHour === currentHour) {
-      currentPriceCalc = parseFloat(p.price);
-    }
+  if (fromDate.getTime() <= nowMs && nowMs < tillDate.getTime()) {
+    currentPriceCalc = priceVal;
   }
+
+  // Hour key from the parsed timestamp — correct for local-offset and UTC ('Z')
+  // timestamps. The UTC hour is added so the two 02:00 hours of the autumn
+  // clock change stay separate.
+  var hKey = dateKeyOf(fromDate) + 'T' + pad2(fromDate.getHours()) + '/' + fromDate.getUTCHours();
+  var slot = hourMap[hKey];
+  if (!slot) {
+    slot = { from: fromDate, till: tillDate, sum: 0, n: 0, price: 0, localHour: fromDate.getHours(), dateStr: dateKeyOf(fromDate) };
+    hourMap[hKey] = slot;
+    hourSlots.push(slot);
+  }
+  slot.sum += priceVal;
+  slot.n++;
+  if (fromDate < slot.from) slot.from = fromDate;
+  if (tillDate > slot.till) slot.till = tillDate;
+}
+for (var hs = 0; hs < hourSlots.length; hs++) {
+  hourSlots[hs].price = hourSlots[hs].sum / hourSlots[hs].n;
+}
+hourSlots.sort(function(a, b) { return a.from - b.from; });
+
+// Today's average, and the hours of today that are still to come
+var totalPrice     = 0;
+var todayCount     = 0;
+var remainingToday = [];
+for (var t = 0; t < hourSlots.length; t++) {
+  if (hourSlots[t].dateStr !== localDateStr) continue;
+  totalPrice += hourSlots[t].price;
+  todayCount++;
+  if (hourSlots[t].till > now) remainingToday.push(hourSlots[t]);
 }
 
-var avgPriceCalc = todayCount > 0 ? totalPrice / todayCount : 0.10;
+// No (remaining) hours for today — array holds only tomorrow, or stale data
+if (todayCount === 0 || remainingToday.length === 0) {
+  setFallback('No remaining price hours for today');
+  return msg;
+}
 
-// Override msg so EMS uses Frank Energie prices
+var avgPriceCalc = totalPrice / todayCount;
+context.set('lastAvgPrice', avgPriceCalc);
+context.set('lastAvgDate',  localDateStr);
+
+if (currentPriceCalc === null && remainingToday[0].from <= now) {
+  currentPriceCalc = remainingToday[0].price;
+}
+
+// Override msg so the EMS uses Frank Energie prices
 msg.currentPrice = currentPriceCalc !== null ? String(currentPriceCalc) : msg.currentPrice;
 msg.avgPrice     = String(avgPriceCalc);
 
@@ -174,244 +255,198 @@ var chargePriceCap  = batterySoC >= SOC_NORMAL_THRESHOLD
   : avgPriceCalc * 0.99;                 // expanded: SoC low — any below-avg hour qualifies
 var dischargeAbsMin = avgPriceCalc * DISCHARGE_ABS_RATIO;
 
-// Only consider remaining hours today
-var remainingToday = [];
-for (var r = 0; r < allParsed.length; r++) {
-  if (allParsed[r].dateStr === localDateStr && allParsed[r].till > now) {
-    remainingToday.push(allParsed[r]);
-  }
+// ── Charge horizon: the current price valley ──────────────────────────────────
+// From now until the first above-average hour that comes after a below-average
+// hour. It continues past midnight when tomorrow's prices are in the array, so
+// the charge window is centred on the real bottom of the valley. Index 0 is
+// always the current hour.
+var chargeHorizon = [];
+var seenBelowAvg  = false;
+var seenHours     = {};
+for (var ch = 0; ch < hourSlots.length; ch++) {
+  var hSlot = hourSlots[ch];
+  if (!(hSlot.till > now)) continue;
+  if (seenHours[hSlot.localHour]) break;                       // never the same clock hour twice
+  if (seenBelowAvg && hSlot.price >= avgPriceCalc) break;      // the valley ends here
+  if (hSlot.price < avgPriceCalc) seenBelowAvg = true;
+  seenHours[hSlot.localHour] = true;
+  chargeHorizon.push(hSlot);
+  if (chargeHorizon.length >= MAX_HORIZON_SLOTS) break;
 }
 
-// v2.15: no remaining hours for today (array holds only tomorrow, or stale data)
-// → fall back instead of crashing on remainingToday[0] below
-if (remainingToday.length === 0) {
-  setFallback('No remaining price hours for today');
-  return msg;
+// Cheapest hour of the valley = centre of the charge window
+var centerIdx = 0;
+for (var ci = 1; ci < chargeHorizon.length; ci++) {
+  if (chargeHorizon[ci].price < chargeHorizon[centerIdx].price) centerIdx = ci;
 }
+var cheapestPrice     = chargeHorizon[centerIdx].price;
+var cheapestHour      = chargeHorizon[centerIdx].localHour;
+var cheapestIsToday   = chargeHorizon[centerIdx].dateStr === localDateStr;
+var chargeWindowValid = cheapestPrice <= chargePriceCap;
+var hoursUntilCheapWindow = centerIdx;          // index 0 = current hour
+var windowNotYetOpen      = centerIdx > 0;
 
-// Count remaining hours with negative price — used by EMS to spread charge rate
+// ── Negative prices today ─────────────────────────────────────────────────────
+// Hours with a negative price that are left today. The current hour counts only
+// for the part that is still to come, so the EMS spreads the charge correctly.
 var negPriceHoursRemaining = 0;
+var futureNegHours  = [];        // negative hours after the current hour
+var firstNegHourIdx = -1;
 for (var np = 0; np < remainingToday.length; np++) {
-  if (remainingToday[np].price < 0) negPriceHoursRemaining++;
-}
-
-// Detect upcoming negative price hours for pre-discharge strategy.
-// If negative prices are coming later today, we want to discharge the battery
-// now (at the best current price) to free up capacity for negative price charging.
-var now2 = new Date();
-var currentHourVal = now2.getHours();
-var futureNegHours = [];         // negative price hours still in the future (not current hour)
-var firstNegHourIdx = -1;        // index in remainingToday of first future negative hour
-
-for (var fn = 0; fn < remainingToday.length; fn++) {
-  if (remainingToday[fn].price < 0 && remainingToday[fn].localHour > currentHourVal) {
-    futureNegHours.push(remainingToday[fn]);
-    if (firstNegHourIdx === -1) firstNegHourIdx = fn;
+  if (remainingToday[np].price >= 0) continue;
+  if (np === 0 && remainingToday[0].from <= now) {
+    var hourLen = remainingToday[0].till.getTime() - remainingToday[0].from.getTime();
+    negPriceHoursRemaining += Math.max(0.25, Math.min(1, (remainingToday[0].till.getTime() - nowMs) / hourLen));
+  } else {
+    negPriceHoursRemaining += 1;
+    futureNegHours.push(remainingToday[np]);
+    if (firstNegHourIdx === -1) firstNegHourIdx = np;
   }
 }
+negPriceHoursRemaining = parseFloat(negPriceHoursRemaining.toFixed(2));
+var hoursUntilNegWindow = firstNegHourIdx !== -1 ? firstNegHourIdx : 99;
 
-var hoursUntilNegWindow = firstNegHourIdx !== -1
-  ? remainingToday[firstNegHourIdx].localHour - currentHourVal
-  : 99;
+// ── Pre-discharge before a negative price window ──────────────────────────────
+// Only free what the negative window can put back: hours × max charge rate.
+// The EMS discharges down to preDischargeTargetSoC and no further.
+var negRefillKwh          = futureNegHours.length * maxChargeKw;
+var preDischargeTargetSoC = Math.max(SOC_DISCHARGE_MIN_PL,
+  Math.ceil(SOC_MAX - (negRefillKwh / BATTERY_KWH * 100)));
+var capacityToFree = Math.max(0, BATTERY_KWH * ((batterySoC - preDischargeTargetSoC) / 100));
 
-// How much capacity can we free by discharging to SOC_DISCHARGE_MIN?
-var SOC_DISCHARGE_MIN_LOCAL = SOC_DISCHARGE_MIN_PL;
-var currentKwhForDischarge  = BATTERY_KWH * ((batterySoC - SOC_MIN) / 100);
-var minKwh                  = BATTERY_KWH * ((SOC_DISCHARGE_MIN_LOCAL - SOC_MIN) / 100);
-var capacityToFree          = Math.max(0, currentKwhForDischarge - minKwh);
-
-// Pre-discharge window: hours between now and the negative window where price > dischargeAbsMin
-// We only pre-discharge in hours that are worth discharging (above avg × DISCHARGE_ABS_RATIO)
 var preDischargeHours = [];
-if (futureNegHours.length > 0 && hoursUntilNegWindow > 0 && hoursUntilNegWindow < 99) {
-  for (var pd = 0; pd < remainingToday.length; pd++) {
+if (futureNegHours.length > 0 && firstNegHourIdx > 0) {
+  for (var pd = 0; pd < firstNegHourIdx; pd++) {
     var pdHour = remainingToday[pd];
-    // Only hours before the negative window, above dischargeAbsMin, and not already negative
-    if (pdHour.localHour < futureNegHours[0].localHour
-        && pdHour.price >= avgPriceCalc * DISCHARGE_ABS_RATIO
-        && pdHour.price >= 0) {
+    // Only hours worth discharging in (above avg × DISCHARGE_ABS_RATIO, not negative)
+    if (pdHour.price >= dischargeAbsMin && pdHour.price >= 0) {
       preDischargeHours.push(pdHour.localHour);
     }
   }
 }
 
-var inPreDischargeWindow = preDischargeHours.indexOf(currentHourVal) !== -1
+var inPreDischargeWindow = preDischargeHours.indexOf(currentHour) !== -1
   && futureNegHours.length > 0
-  && batterySoC > SOC_DISCHARGE_MIN_LOCAL
+  && batterySoC > preDischargeTargetSoC
   && capacityToFree > 0;
 
-// Solar overfill pre-discharge:
-// If current solar production will fill the battery before the cheap price window opens,
-// discharge now to create headroom so the cheap grid window can actually be used.
-//
-// Uses current real-time solar production rate (W) × hours until cheap window
-// to estimate how much solar will arrive before the window — more accurate than
-// the daily forecast total which doesn't account for timing.
-//
-// Also always reserves MIN_GRID_CHEAP_KWH headroom at the cheapest hour regardless,
-// so the system always buys some energy at the lowest price of the day.
-var MIN_GRID_CHEAP_KWH = 3.0;  // minimum kWh to always absorb at cheapest price
+// ── Solar that still arrives before / after the cheap window ──────────────────
+// Current production rate × hours until the cheap window, capped by what is
+// left of today's forecast (the current rate does not last past sunset).
+var solarRateKw            = solarNow_W / 1000;
+var solarBeforeCheapWindow = Math.min(solarRateKw * hoursUntilCheapWindow, solarUsableKwh);
+var solarAfterCheapWindow  = Math.max(0, solarUsableKwh - solarBeforeCheapWindow);
 
-// First pass: find cheapest hour from remaining today for overfill check
-var planPricesCheck    = remainingToday.slice();
-planPricesCheck.sort(function(a, b) { return a.price - b.price; });
-var cheapestHourCheck  = planPricesCheck.length > 0 ? planPricesCheck[0].localHour : 99;
-var cheapestPriceCheck = planPricesCheck.length > 0 ? planPricesCheck[0].price : 999;
-var cheapWindowAhead   = cheapestPriceCheck <= chargePriceCap;
-var windowNotYetOpen   = cheapestHourCheck > currentHourVal;
+// Grid only has to cover what the solar AFTER the cheap window will not
+kwhFromGrid = Math.max(0, kwhNeeded - solarAfterCheapWindow);
+hoursNeeded = Math.ceil(kwhFromGrid / maxChargeKw) + SAFETY_BUFFER_H;
 
-var hoursUntilCheapWindowLocal = Math.max(0, cheapestHourCheck - currentHourVal);
-var totalRemainingHours        = Math.max(1, remainingToday.length);
-
-// Estimate solar arriving before cheap window using current production rate
-var solarRateKwh          = solarNow_W / 1000;  // current kW
-var solarBeforeCheapWindow = Math.min(solarRateKwh * hoursUntilCheapWindowLocal, solarUsableKwh);  // v2.15: capped by forecast — the current rate doesn't last past sunset
-
-// Recalculate kwhFromGrid using only solar AFTER cheap window
-var solarAfterCheapWindow = Math.max(0, solarUsableKwh - solarBeforeCheapWindow);
-kwhFromGrid  = Math.max(0, kwhNeeded - solarAfterCheapWindow);
-hoursNeeded  = Math.ceil(kwhFromGrid / maxChargeKw) + SAFETY_BUFFER_H;
-
+// ── Solar overfill pre-discharge ──────────────────────────────────────────────
+// If the solar still to come before the cheap window would fill the battery,
+// discharge now so that at the cheap window there is room for that solar plus
+// MIN_GRID_CHEAP_KWH of cheap grid energy. The target SoC follows from the solar
+// estimate only (not from the current SoC), and the action is latched until the
+// target is reached — it does not stop the moment the overfill flag clears.
 var currentHeadroom = Math.max(0, usableCapacity - currentKwh);
 
-// Solar will overfill if estimated solar before window exceeds available headroom
-var solarWillOverfill = cheapWindowAhead
-  && solarBeforeCheapWindow > 0     // v2.15: no solar → no overfill
+var solarOverfillTrigger = chargeWindowValid
+  && cheapestIsToday
   && windowNotYetOpen
-  && solarBeforeCheapWindow >= currentHeadroom * SOLAR_OVERFILL_RATIO
-  && hoursUntilCheapWindowLocal > 0;
+  && solarBeforeCheapWindow > 0
+  && solarBeforeCheapWindow >= currentHeadroom * SOLAR_OVERFILL_RATIO;
 
-// kWh to free = max of what grid window needs AND minimum cheap-hour absorption
-// Even if kwhFromGrid=0 (solar covers all), we still want to buy MIN_GRID_CHEAP_KWH
-// at the cheapest price of the day
-var kwhToFreeForSolar  = 0;
-var solarPreDischargeHours = [];
+var requiredHeadroomKwh        = solarBeforeCheapWindow + MIN_GRID_CHEAP_KWH;
+var solarPreDischargeTargetSoC = Math.max(SOC_DISCHARGE_MIN_PL,
+  Math.floor(SOC_MAX - (requiredHeadroomKwh / BATTERY_KWH * 100)));
+
+var solarPreLatched   = context.get('solarPreActive') === true;
+var solarWillOverfill = (solarOverfillTrigger || solarPreLatched)
+  && chargeWindowValid
+  && cheapestIsToday
+  && windowNotYetOpen
+  && solarBeforeCheapWindow > 0
+  && batterySoC > solarPreDischargeTargetSoC;
+context.set('solarPreActive', solarWillOverfill);
+
+var kwhToFreeForSolar         = 0;
+var solarPreDischargeHours    = [];
 var inSolarPreDischargeWindow = false;
-var solarPreDischargeTargetSoC = SOC_DISCHARGE_MIN_PL;
 
 if (solarWillOverfill) {
-  // v2.15: bounded by energy that can actually be discharged, not by headroom —
-  // a near-full battery (the typical overfill case) freed almost nothing before
-  kwhToFreeForSolar = Math.min(
-    Math.max(kwhFromGrid, MIN_GRID_CHEAP_KWH),
-    capacityToFree
-  );
+  kwhToFreeForSolar = Math.max(0, BATTERY_KWH * ((batterySoC - solarPreDischargeTargetSoC) / 100));
 
-  var kwhAfterDischarge = Math.max(
-    BATTERY_KWH * ((SOC_DISCHARGE_MIN_PL - SOC_MIN) / 100),
-    currentKwh - kwhToFreeForSolar
-  );
-  solarPreDischargeTargetSoC = Math.round(SOC_MIN + (kwhAfterDischarge / BATTERY_KWH * 100));
-
-  // Pre-discharge hours: from now until cheap window, price above dischargeAbsMin
-  for (var sp = 0; sp < remainingToday.length; sp++) {
-    var spHour = remainingToday[sp];
-    if (spHour.localHour < cheapestHourCheck
-        && spHour.localHour >= currentHourVal
-        && spHour.price >= dischargeAbsMin
-        && spHour.price >= 0) {
+  // Pre-discharge hours: from now until the cheap window, price above dischargeAbsMin
+  for (var sp = 0; sp < centerIdx; sp++) {
+    var spHour = chargeHorizon[sp];
+    if (spHour.price >= dischargeAbsMin && spHour.price >= 0) {
       solarPreDischargeHours.push(spHour.localHour);
     }
   }
 
-  inSolarPreDischargeWindow = solarPreDischargeHours.indexOf(currentHourVal) !== -1
-    && batterySoC > solarPreDischargeTargetSoC
+  inSolarPreDischargeWindow = solarPreDischargeHours.indexOf(currentHour) !== -1
     && solarPreDischargeHours.length >= SOLAR_PRE_MIN_HOURS;
+} else {
+  solarPreDischargeTargetSoC = SOC_DISCHARGE_MIN_PL;
 }
 
-// Sort remaining by price ascending to find cheapest hour
-var planPrices = remainingToday.slice();
-planPrices.sort(function(a, b) { return a.price - b.price; });
-
-var cheapestPrice = planPrices.length > 0 ? planPrices[0].price : null;
-
-// Build charge window centered on the cheapest hour, expanding outward.
-// remainingToday is already in time order (ascending from). Find the index
-// of the cheapest hour within it, then expand left/right picking the
-// cheaper neighbour at each step until hoursNeeded slots are filled.
-// This guarantees the cheapest hour is always inside the window and the
-// window is contiguous in time — the battery charges through the price valley.
-
-var cheapestHour = planPrices.length > 0 ? planPrices[0].localHour : currentHour;
-
-// Find center index in time-ordered remainingToday
-var centerIdx = 0;
-for (var ci = 0; ci < remainingToday.length; ci++) {
-  if (remainingToday[ci].localHour === cheapestHour) { centerIdx = ci; break; }
-}
-
+// ── Charge window ─────────────────────────────────────────────────────────────
+// Centred on the cheapest hour of the valley, expanding outward to the cheaper
+// neighbour until hoursNeeded hours are filled. Contiguous in time, never into
+// above-average hours.
 var windowIndices = [centerIdx];
 var left  = centerIdx - 1;
 var right = centerIdx + 1;
 
 while (windowIndices.length < hoursNeeded) {
-  // v2.15: never extend the charge window into above-average hours
-  var canLeft  = left >= 0                    && remainingToday[left].price  < avgPriceCalc;
-  var canRight = right < remainingToday.length && remainingToday[right].price < avgPriceCalc;
+  var canLeft  = left >= 0                   && chargeHorizon[left].price  < avgPriceCalc;
+  var canRight = right < chargeHorizon.length && chargeHorizon[right].price < avgPriceCalc;
   if (!canLeft && !canRight) break;
 
   var pickLeft;
   if      (!canRight) { pickLeft = true; }
   else if (!canLeft)  { pickLeft = false; }
   else {
-    var leftPrice  = remainingToday[left].price;
-    var rightPrice = remainingToday[right].price;
-    var priceDiff  = rightPrice - leftPrice;  // positive = right is more expensive
-    if (priceDiff >= -EARLY_BIAS_EUR) {
-      // Right is more expensive, same price, or only marginally cheaper than left:
-      // prefer left (earlier hour) — keeps grid charging before solar peak.
-      // Only pick right when it is cheaper by more than the bias margin.
-      pickLeft = true;
-    } else {
-      pickLeft = false;
-    }
+    // Prefer the earlier hour unless the later one is cheaper by more than the
+    // bias margin — keeps grid charging before the solar peak.
+    var priceDiff = chargeHorizon[right].price - chargeHorizon[left].price;
+    pickLeft = priceDiff >= -EARLY_BIAS_EUR;
   }
 
   if (pickLeft) { windowIndices.push(left);  left--;  }
   else          { windowIndices.push(right); right++; }
 }
 
+// No window when even the cheapest hour of the valley is above the price cap —
+// the EMS then uses its ratio-based logic only.
 var cheapestHours = [];
-for (var wi = 0; wi < windowIndices.length; wi++) {
-  cheapestHours.push(remainingToday[windowIndices[wi]].localHour);
+var inWindow      = false;
+if (chargeWindowValid) {
+  windowIndices.sort(function(a, b) { return a - b; });
+  for (var wi = 0; wi < windowIndices.length; wi++) {
+    cheapestHours.push(chargeHorizon[windowIndices[wi]].localHour);   // in time order
+  }
+  inWindow = windowIndices.indexOf(0) !== -1;
 }
 
-// Only build a charge window if the cheapest available hour is actually below
-// the price cap. If all remaining hours are expensive (e.g. late evening),
-// no charge window is set — the EMS falls back to ratio-based logic only.
-var chargeWindowValid = cheapestPrice !== null && cheapestPrice <= chargePriceCap;
-if (!chargeWindowValid) {
-  cheapestHours = [];
-}
-var inWindow = chargeWindowValid && cheapestHours.indexOf(currentHour) !== -1;
-
-// Calculate discharge window size from actual kWh available
+// ── Discharge window (remaining hours of today) ───────────────────────────────
+// Sized for a full battery at maximum rate. The EMS only covers the house load,
+// so in practice this is "up to N above-average hours around the day's peak".
 var kwhToDischarge       = BATTERY_KWH * ((SOC_DISCHARGE_MAX - SOC_DISCHARGE_MIN_PL) / 100);
 var dischargeHoursNeeded = Math.min(Math.ceil(kwhToDischarge / MAX_DISCHARGE_KW) + 1, remainingToday.length);
 
-// Find most expensive remaining hour (above avgPrice) as window center
-var dischargePool = [];
+// Most expensive remaining hour (above avgPrice) as window centre
+var dCenterIdx = -1;
 for (var dp = 0; dp < remainingToday.length; dp++) {
-  if (remainingToday[dp].price >= avgPriceCalc) {
-    dischargePool.push(remainingToday[dp]);
-  }
+  if (remainingToday[dp].price < avgPriceCalc) continue;
+  if (dCenterIdx === -1 || remainingToday[dp].price > remainingToday[dCenterIdx].price) dCenterIdx = dp;
 }
-dischargePool.sort(function(a, b) { return b.price - a.price; });
 
 var expensiveHours     = [];
 var dischargeThreshold = null;
 
-if (dischargePool.length > 0) {
-  var mostExpensiveHour = dischargePool[0].localHour;
-
-  var dCenterIdx = 0;
-  for (var dc = 0; dc < remainingToday.length; dc++) {
-    if (remainingToday[dc].localHour === mostExpensiveHour) { dCenterIdx = dc; break; }
-  }
-
-  // Expand outward from most expensive hour.
-  // LATE_BIAS_EUR: when neighbours are within margin, prefer the later hour
-  // to keep the window anchored in the evening peak band.
+if (dCenterIdx !== -1) {
+  // Expand outward. LATE_BIAS_EUR: when neighbours are within the margin, prefer
+  // the later hour to keep the window anchored in the evening peak band.
   var dWindowIdx = [dCenterIdx];
   var dLeft  = dCenterIdx - 1;
   var dRight = dCenterIdx + 1;
@@ -432,68 +467,59 @@ if (dischargePool.length > 0) {
     if (dPickLeft) { dWindowIdx.push(dLeft);  dLeft--;  }
     else           { dWindowIdx.push(dRight); dRight++; }
   }
+  dWindowIdx.sort(function(a, b) { return a - b; });
 
+  // Skip hours that are also charge hours; threshold = lowest price in the window
   for (var dw = 0; dw < dWindowIdx.length; dw++) {
-    expensiveHours.push(remainingToday[dWindowIdx[dw]].localHour);
-  }
-
-  // Remove hours conflicting with charge window
-  var filteredDischargeHours = [];
-  for (var fd = 0; fd < expensiveHours.length; fd++) {
-    if (cheapestHours.indexOf(expensiveHours[fd]) === -1) {
-      filteredDischargeHours.push(expensiveHours[fd]);
-    }
-  }
-  expensiveHours = filteredDischargeHours;
-
-  // Threshold = lowest price in selected discharge window
-  for (var rt = 0; rt < remainingToday.length; rt++) {
-    if (expensiveHours.indexOf(remainingToday[rt].localHour) !== -1) {
-      if (dischargeThreshold === null || remainingToday[rt].price < dischargeThreshold) {
-        dischargeThreshold = remainingToday[rt].price;
-      }
-    }
+    var dSlot = remainingToday[dWindowIdx[dw]];
+    if (cheapestHours.indexOf(dSlot.localHour) !== -1) continue;
+    expensiveHours.push(dSlot.localHour);
+    if (dischargeThreshold === null || dSlot.price < dischargeThreshold) dischargeThreshold = dSlot.price;
   }
 }
 
-cheapestHours.sort(function(a, b) { return a - b; });
-expensiveHours.sort(function(a, b) { return a - b; });
-
 var inDischargeWindow = expensiveHours.indexOf(currentHour) !== -1;
 
-msg.plannerVersion        = PLANNER_VERSION;
-msg.inChargingWindow      = inWindow;
-msg.inDischargeWindow     = inDischargeWindow;
-msg.dischargeThreshold    = dischargeThreshold;
-msg.plannedChargeHours    = cheapestHours;
-msg.plannedDischargeHours = expensiveHours;
-msg.hoursNeeded           = hoursNeeded;
-msg.kwhNeeded             = parseFloat(kwhNeeded.toFixed(2));
+// ── Output ────────────────────────────────────────────────────────────────────
+msg.plannerVersion             = PLANNER_VERSION;
+msg.inChargingWindow           = inWindow;
+msg.inDischargeWindow          = inDischargeWindow;
+msg.dischargeThreshold         = dischargeThreshold;
+msg.plannedChargeHours         = cheapestHours;
+msg.plannedDischargeHours      = expensiveHours;
+msg.hoursNeeded                = hoursNeeded;
+msg.kwhNeeded                  = parseFloat(kwhNeeded.toFixed(2));
+msg.kwhFromGrid                = parseFloat(kwhFromGrid.toFixed(2));
+msg.solarForecastKwh           = parseFloat(solarUsableKwh.toFixed(2));
 msg.cheapestPrice              = cheapestPrice;
-msg.cheapestHour               = (typeof cheapestHour !== 'undefined') ? cheapestHour : null;
-  msg.negPriceHoursRemaining     = negPriceHoursRemaining;
-  msg.inPreDischargeWindow       = inPreDischargeWindow;
-  msg.preDischargeHours          = preDischargeHours;
-  msg.hoursUntilNegWindow        = hoursUntilNegWindow < 99 ? hoursUntilNegWindow : null;
-  msg.futureNegHoursCount             = futureNegHours.length;
-  msg.inSolarPreDischargeWindow       = inSolarPreDischargeWindow;
-  msg.solarPreDischargeHours          = solarPreDischargeHours;
-  msg.solarPreDischargeTargetSoC      = solarPreDischargeTargetSoC;
-  msg.kwhToFreeForSolar               = parseFloat(kwhToFreeForSolar.toFixed(2));
-  msg.solarWillOverfill               = solarWillOverfill;
-  msg.solarAfterCheapWindow           = parseFloat(solarAfterCheapWindow.toFixed(2));
-  msg.kwhNeededForGrid                = parseFloat(kwhFromGrid.toFixed(2));
-msg.plannerReason         =
+msg.cheapestHour               = cheapestHour;
+msg.negPriceHoursRemaining     = negPriceHoursRemaining;
+msg.inPreDischargeWindow       = inPreDischargeWindow;
+msg.preDischargeHours          = preDischargeHours;
+msg.preDischargeTargetSoC      = preDischargeTargetSoC;
+msg.hoursUntilNegWindow        = hoursUntilNegWindow < 99 ? hoursUntilNegWindow : null;
+msg.futureNegHoursCount        = futureNegHours.length;
+msg.inSolarPreDischargeWindow  = inSolarPreDischargeWindow;
+msg.solarPreDischargeHours     = solarPreDischargeHours;
+msg.solarPreDischargeTargetSoC = solarPreDischargeTargetSoC;
+msg.kwhToFreeForSolar          = parseFloat(kwhToFreeForSolar.toFixed(2));
+msg.solarWillOverfill          = solarWillOverfill;
+msg.solarAfterCheapWindow      = parseFloat(solarAfterCheapWindow.toFixed(2));
+msg.kwhNeededForGrid           = parseFloat(kwhFromGrid.toFixed(2));
+
+var hoursText = function(list) { return list.map(function(h) { return h + 'h'; }).join(', '); };
+
+msg.plannerReason =
   'Need ' + kwhNeeded.toFixed(1) + ' kWh total' +
     (solarUsableKwh > 0 ? ', solar covers ~' + solarUsableKwh.toFixed(1) + ' kWh, ' + kwhFromGrid.toFixed(1) + ' kWh from grid (' + hoursNeeded + 'h)' : ' from grid (' + hoursNeeded + 'h)') + '. ' +
-  'SoC ' + batterySoC + '% - cheapest hour: ' + cheapestHour + 'h (' + (cheapestPrice !== null ? cheapestPrice.toFixed(3) : '?') + ' EUR), window centered there. ' +
+  'SoC ' + batterySoC + '% - cheapest hour: ' + cheapestHour + 'h' + (cheapestIsToday ? '' : ' tomorrow') + ' (' + cheapestPrice.toFixed(3) + ' EUR), window centered there. ' +
   'Avg: ' + avgPriceCalc.toFixed(3) + ' EUR. ' +
-  'Charge hours: ' + cheapestHours.map(function(h) { return h + 'h'; }).join(', ') +
-  '. Discharge hours: ' + expensiveHours.map(function(h) { return h + 'h'; }).join(', ') +
-  '. Discharge threshold: ' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +
+  'Charge hours: ' + hoursText(cheapestHours) +
+  '. Discharge hours: ' + hoursText(expensiveHours) +
+  '. Discharge threshold: ' + (dischargeThreshold !== null ? dischargeThreshold.toFixed(3) : '?') + ' EUR' +
   '. In charge window: ' + inWindow +
   '. In discharge window: ' + inDischargeWindow +
-  (futureNegHours.length > 0 ? '. Neg price in ' + (hoursUntilNegWindow < 99 ? hoursUntilNegWindow + 'h' : '?') + ' (' + futureNegHours.length + ' neg hour(s)). Pre-discharge: ' + inPreDischargeWindow : '') +
+  (futureNegHours.length > 0 ? '. Neg price in ' + hoursUntilNegWindow + 'h (' + futureNegHours.length + ' neg hour(s)), pre-discharge to ' + preDischargeTargetSoC + '%: ' + inPreDischargeWindow : '') +
   (solarWillOverfill ? '. Solar overfill expected — pre-discharge to ' + solarPreDischargeTargetSoC + '% (' + kwhToFreeForSolar.toFixed(1) + ' kWh). Solar pre-dch: ' + inSolarPreDischargeWindow : '') +
   '. Solar after window: ' + solarAfterCheapWindow.toFixed(1) + ' kWh';
 
@@ -502,7 +528,7 @@ node.status({
   shape: 'dot',
   text:  PLANNER_VERSION + ' ' + (inWindow ? 'CHG' : inDischargeWindow ? 'DCH' : 'IDLE') +
     ' | SoC:' + batterySoC + '% cap:' + chargePriceCap.toFixed(2) +
-    ' | dch>' + (dischargeThreshold ? dischargeThreshold.toFixed(3) : '?') + 'EUR' +
+    ' | dch>' + (dischargeThreshold !== null ? dischargeThreshold.toFixed(3) : '?') + 'EUR' +
     ' | hour ' + currentHour + 'h'
 });
 
