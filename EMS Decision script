@@ -1,4 +1,50 @@
 // EMS Decision Engine
+// v3.94 - EV v2.23: fixes from the second code review —
+//          Battery
+//          (1) missing sensor data is no longer read as a number: an unknown
+//              price was 0 EUR (→ grid charging at 100A as "price override"),
+//              an unknown SoC was 50%, unknown meter values were 0 A. Now:
+//              price or average unknown → no price-based charge or discharge;
+//              SoC unknown for more than 5 min → battery idle; DSMR values
+//              unknown → battery idle and EV at the 6A baseline
+//          (2) the battery's own power is added back to the grid readings
+//              (CFG.COMPENSATE_OWN_POWER). The charge limit, the discharge
+//              target and the solar surplus were all calculated from readings
+//              that already contained the battery's own effect, so the
+//              setpoints hunted (charging one run in three, discharge jumping
+//              between 1.7 and 2.6 kW against a 3 kW load)
+//          (3) solar surplus charging multiplies by the efficiency instead of
+//              dividing — it asked for ~18% more than the surplus and pulled
+//              the rest from the grid
+//          (4) inside the planner's charge window the battery charges at the
+//              full allowed rate — the planner sizes the window for that rate;
+//              the price-scaled rate is kept for charging outside the window
+//          (5) pre-discharge before negative prices stops at the planner's
+//              msg.preDischargeTargetSoC (what the negative window can refill)
+//          (6) solar pre-discharge spreads the energy over the hours that are
+//              left (was kWh used as kW: anything above 4.8 kWh meant 100A)
+//          (7) state changes are confirmed on the second run, as they always
+//              were in practice — the CONFIRM_CYCLES 1-or-2 logic had no effect
+//          (8) the 97% hard stop only reports when it really blocks charging;
+//              it no longer overwrites the reason while discharging
+//          (9) current solar production is stored in flow context for the
+//              planner (no separate "Set solarNow" node needed)
+//          EV
+//          (10) the night minimum of 8A no longer overrides the phase headroom:
+//               8A 3-phase needs 8A free on every phase, otherwise 6A single-
+//               phase. It used to push a phase over 20A, be cut, wait out the
+//               hold and do it again
+//          (11) an overload trim leaves 0.5A margin instead of landing exactly
+//               on the 20A limit, where meter noise confirmed a second overload
+//          (12) ramp, overload hold, cut cooldown and nudge cooldown follow the
+//               clock (one "poll" = 30 s of elapsed time), so they keep their
+//               length when the flow is triggered more or less often
+//          (13) a step up is sent at most once per 60 s; steps down are always
+//               sent at once
+//          (14) EV load estimate when the charger's power sensor is unavailable
+//               (the fallback could never be reached)
+//          (15) msg.evCanCharge on output 2 — false during a session cut and its
+//               cooldown, for a switch node that really pauses the charger
 // v3.93 - EV v2.22: charger decides, car data is optional — fixes a deadlock
 //          introduced in v3.90: with ev_soc unavailable (guest car, or the
 //          car integration offline) and Zaptec in connected_finished, the car
@@ -85,8 +131,8 @@
 // v3.68 - smarter overload response
 // v3.65 - blackout window 17h-19h set to 5A
 
-var EMS_VERSION = 'EMS v3.93';
-var EV_VERSION = 'EV v2.22';
+var EMS_VERSION = 'EMS v3.94';
+var EV_VERSION = 'EV v2.23';
 
 var CFG = {
   MAX_AMPS: 100,
@@ -114,21 +160,52 @@ var CFG = {
   SOLAR_SUPPRESS_DISCHARGE_W: 500,
   EV_RATE_LIMIT_MS: 15 * 60 * 1000,
   EV_PUBLIC_RATE: 0.50,
-  EV_1PHASE_GRID_PHASE: 2      // grid phase the Zaptec uses in single-phase mode (measured: L2)
+  EV_1PHASE_GRID_PHASE: 2,     // grid phase the Zaptec uses in single-phase mode (measured: L2)
+  COMPENSATE_OWN_POWER: true,  // add the battery's own charge/discharge power back to the grid readings
+  SOC_MAX_AGE_MS: 5 * 60 * 1000  // how long the last known SoC may be used when the sensor drops out
 };
 
-var currentPrice = parseFloat(msg.currentPrice) || 0;
-var avgPrice = parseFloat(msg.avgPrice) || 0.10;
+// ── Inputs ────────────────────────────────────────────────────────────────────
+// A sensor that is 'unavailable' / 'unknown' gives null here — never a number.
+var num = function (v) { var n = parseFloat(v); return isNaN(n) ? null : n; };
+var nowMs = new Date().getTime();
+var dataNotes = [];
+
+var priceRaw = num(msg.currentPrice);
+var avgRaw = num(msg.avgPrice);
+var priceKnown = priceRaw !== null;
+var avgKnown = avgRaw !== null && avgRaw > 0;
+var pricesOk = priceKnown && avgKnown;      // needed for every price-ratio rule
+var currentPrice = priceKnown ? priceRaw : 0;
+var avgPrice = avgKnown ? avgRaw : 0.10;    // display value only when the average is unknown
+if (!priceKnown) { dataNotes.push('price unknown'); }
+else if (!avgKnown) { dataNotes.push('average price unknown'); }
 var inChargingWindow = msg.inChargingWindow;
 
-var gridImport = parseFloat(msg.gridImport) || 0;
-var gridExport = parseFloat(msg.gridExport) || 0;
+var gridImportRaw = num(msg.gridImport);
+var gridExportRaw = num(msg.gridExport);
+var phaseL1Raw = num(msg.phaseL1);
+var phaseL2Raw = num(msg.phaseL2);
+var phaseL3Raw = num(msg.phaseL3);
+var metersKnown = gridImportRaw !== null && gridExportRaw !== null
+  && phaseL1Raw !== null && phaseL2Raw !== null && phaseL3Raw !== null;
+if (!metersKnown) { dataNotes.push('DSMR data unknown'); }
+var gridImport = gridImportRaw !== null ? gridImportRaw : 0;
+var gridExport = gridExportRaw !== null ? gridExportRaw : 0;
+
+var EV_3PHASE_MIN_A = 7;
 
 var zaptecMode = msg.zaptecMode || '';
 var lastEvAmps = context.get('evLastAmps') || 0;
-var evChargingW = (msg.EVChargeLoad !== undefined && msg.EVChargeLoad !== null)
-  ? parseFloat(msg.EVChargeLoad) || 0
-  : lastEvAmps * CFG.GRID_VOLTAGE * 3;
+// Measured EV load (W). Sensor unavailable while Zaptec reports charging →
+// estimate from the last commanded current.
+var evLoadRaw = num(msg.EVChargeLoad);
+var evSensorUsed = evLoadRaw !== null;
+var evChargingW = evSensorUsed
+  ? evLoadRaw
+  : (zaptecMode === 'connected_charging'
+    ? lastEvAmps * CFG.GRID_VOLTAGE * (lastEvAmps >= EV_3PHASE_MIN_A ? 3 : 1)
+    : 0);
 
 var evSoCRaw = parseFloat(msg.ev_soc);
 var evSoCKnown = !isNaN(evSoCRaw);
@@ -145,13 +222,44 @@ var evCarConnected = (
 );
 var evDrawing = zaptecMode === 'connected_charging' || evChargingW > 0;
 
-var phaseL1kW = parseFloat(msg.phaseL1) || 0;
-var phaseL2kW = parseFloat(msg.phaseL2) || 0;
-var phaseL3kW = parseFloat(msg.phaseL3) || 0;
+var phaseL1kW = phaseL1Raw !== null ? phaseL1Raw : 0;
+var phaseL2kW = phaseL2Raw !== null ? phaseL2Raw : 0;
+var phaseL3kW = phaseL3Raw !== null ? phaseL3Raw : 0;
 var pac1 = parseFloat(msg.pac1) || 0;
 var pac2 = parseFloat(msg.pac2) || 0;
 var pac3 = parseFloat(msg.pac3) || 0;
-var batterySoC = parseFloat(msg.batterySoC) || 50;
+
+// Battery SoC. Sensor unavailable → last known value for up to SOC_MAX_AGE_MS,
+// after that the SoC counts as unknown and the battery is kept idle.
+var socRaw = num(msg.batterySoC);
+if (socRaw !== null) {
+  context.set('lastGoodSoC', socRaw);
+  context.set('lastGoodSoCTime', nowMs);
+} else {
+  var lastGoodSoC = num(context.get('lastGoodSoC'));
+  var lastGoodSoCTime = context.get('lastGoodSoCTime') || 0;
+  if (lastGoodSoC !== null && (nowMs - lastGoodSoCTime) <= CFG.SOC_MAX_AGE_MS) { socRaw = lastGoodSoC; }
+}
+var socKnown = socRaw !== null;
+var batterySoC = socKnown ? socRaw : 50;   // 50 is a display value only; nothing is done with it
+if (!socKnown) { dataNotes.push('battery SoC unknown'); }
+
+var lastState = context.get('lastState') || 'idle';
+var pendingState = context.get('pendingState') || 'idle';
+var pendingCount = context.get('pendingCount') || 0;
+
+// ── The battery's own power ───────────────────────────────────────────────────
+// What was sent to the inverter on the previous run. The grid readings of this
+// run already contain that charge or discharge power; it is added back below so
+// the new setpoint is based on the house, not on the battery's own effect.
+var lastDcAmps = context.get('lastDcAmps') || 0;     // A, when charging
+var lastDcPower = context.get('lastDcPower') || 0;   // W, when discharging
+var ownChargeAcW = (CFG.COMPENSATE_OWN_POWER && lastState === 'charging')
+  ? (lastDcAmps * CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF : 0;
+// Discharge: the setpoint is sent DISCHARGE_OVERSHOOT times higher than the power
+// that is wanted, so what the battery really delivers is setpoint / overshoot.
+var ownDischargeW = (CFG.COMPENSATE_OWN_POWER && lastState === 'discharging')
+  ? lastDcPower / CFG.DISCHARGE_OVERSHOOT : 0;
 
 var rawNetGridW = (gridImport - gridExport) * 1000 - evChargingW;
 var netGridW = Math.max(0, rawNetGridW);
@@ -160,12 +268,15 @@ var phaseL1A = (phaseL1kW * 1000) / CFG.GRID_VOLTAGE;
 var phaseL2A = (phaseL2kW * 1000) / CFG.GRID_VOLTAGE;
 var phaseL3A = (phaseL3kW * 1000) / CFG.GRID_VOLTAGE;
 var maxPhaseLoadA = Math.max(phaseL1A, phaseL2A, phaseL3A);
-var worstPhaseHeadroomA = Math.max(0, CFG.GRID_MAX_A_PHASE - maxPhaseLoadA - CFG.SAFETY_MARGIN_A);
+// Own charge current per phase, never more than the lightest phase actually
+// shows — if the inverter draws less than commanded, less is added back.
+var ownChargePhaseA = Math.min(ownChargeAcW / CFG.GRID_VOLTAGE / 3, Math.min(phaseL1A, phaseL2A, phaseL3A));
+var worstPhaseHeadroomA = metersKnown
+  ? Math.max(0, CFG.GRID_MAX_A_PHASE - maxPhaseLoadA - CFG.SAFETY_MARGIN_A + ownChargePhaseA)
+  : 0;
 var gridHeadroomW = worstPhaseHeadroomA * CFG.GRID_VOLTAGE * 3;
-var maxChargeFromGridA = Math.round((gridHeadroomW / CFG.BATTERY_VOLTAGE) * CFG.ROUND_TRIP_EFF);
+var maxChargeFromGridA = Math.floor((gridHeadroomW / CFG.BATTERY_VOLTAGE) * CFG.ROUND_TRIP_EFF);
 var maxAllowedChargeA = Math.min(CFG.MAX_AMPS, maxChargeFromGridA);
-
-var EV_3PHASE_MIN_A = 7;
 
 // EV draws on all phases in 3-phase mode; in single-phase mode only on the
 // charger's single phase (CFG.EV_1PHASE_GRID_PHASE — L2 in this installation)
@@ -175,28 +286,40 @@ var homeL1W = Math.max(0, phaseL1A - evContribB(1)) * CFG.GRID_VOLTAGE;
 var homeL2W = Math.max(0, phaseL2A - evContribB(2)) * CFG.GRID_VOLTAGE;
 var homeL3W = Math.max(0, phaseL3A - evContribB(3)) * CFG.GRID_VOLTAGE;
 var homeImportW = homeL1W + homeL2W + homeL3W;
-var dischargeTargetW = evChargingW > 0
-  ? Math.max(0, homeImportW)         // EV charging: use house-only import
-  : Math.max(0, gridImport * 1000);  // no EV: full grid import is the target
+var dischargeTargetW;
+if (ownDischargeW > 0) {
+  // Already discharging: house demand = net grid (without the EV) + what the
+  // battery itself is delivering right now
+  dischargeTargetW = Math.max(0, rawNetGridW + ownDischargeW);
+} else if (evChargingW > 0) {
+  dischargeTargetW = Math.max(0, homeImportW);        // EV charging: use house-only import
+} else {
+  dischargeTargetW = Math.max(0, gridImport * 1000);  // no EV: full grid import is the target
+}
 
-var negPriceHoursRemaining = parseInt(msg.negPriceHoursRemaining) || 1;
+var negPriceHoursRemaining = Math.max(0.25, parseFloat(msg.negPriceHoursRemaining) || 1);
 var inPreDischargeWindow = msg.inPreDischargeWindow === true;
 var inSolarPreDischargeWindow = msg.inSolarPreDischargeWindow === true;
 var solarPreDischargeTargetSoC = parseFloat(msg.solarPreDischargeTargetSoC) || 15;
+var preDischargeTargetSoC = Math.max(CFG.SOC_DISCHARGE_MIN, parseFloat(msg.preDischargeTargetSoC) || CFG.SOC_DISCHARGE_MIN);
 var kwhToFreeForSolar = parseFloat(msg.kwhToFreeForSolar) || 0;
 var hoursUntilNegWindow = parseFloat(msg.hoursUntilNegWindow) || 99;
 var futureNegHoursCount = parseInt(msg.futureNegHoursCount) || 0;
 
-var lastState = context.get('lastState') || 'idle';
-var pendingState = context.get('pendingState') || 'idle';
-var pendingCount = context.get('pendingCount') || 0;
-
 var solarTotalW = pac1 + pac2 + pac3;
-var actualSurplusW = (rawNetGridW < 0 && solarTotalW > 50)
-  ? Math.min(Math.abs(rawNetGridW), solarTotalW) : 0;
+// For the planner's solar-overfill estimate on its next run
+if (typeof flow !== 'undefined') {
+  flow.set('emsSolarNowW', solarTotalW);
+  flow.set('emsSolarNowTs', nowMs);
+}
 
-var priceRatio = avgPrice > 0 ? currentPrice / avgPrice : 1;
-var isNegPrice = currentPrice < 0;
+// Solar surplus = what would be exported if the battery were not charging
+var surplusRawW = ownChargeAcW - rawNetGridW;
+var actualSurplusW = (surplusRawW > 0 && solarTotalW > 50)
+  ? Math.min(surplusRawW, solarTotalW) : 0;
+
+var priceRatio = pricesOk ? currentPrice / avgPrice : 1;
+var isNegPrice = priceKnown && currentPrice < 0;
 
 var chargeAbsMax = avgPrice * CFG.CHARGE_ABS_RATIO;
 var dischargeAbsMin = avgPrice * CFG.DISCHARGE_ABS_RATIO;
@@ -204,34 +327,41 @@ var dischargeAbsMin = avgPrice * CFG.DISCHARGE_ABS_RATIO;
 var dischargeRatioThreshold = lastState === 'discharging' ? CFG.DISCHARGE_THRESHOLD - CFG.HYSTERESIS : CFG.DISCHARGE_THRESHOLD;
 
 var isPriceLow;
-var isPriceVeryLow = priceRatio <= CFG.CHARGE_THRESHOLD && currentPrice <= chargeAbsMax;
+var isPriceVeryLow = pricesOk && priceRatio <= CFG.CHARGE_THRESHOLD && currentPrice <= chargeAbsMax;
 
 var currentHourInt = new Date().getHours();
 var cheapestHourInt = (msg.cheapestHour !== undefined && msg.cheapestHour !== null) ? parseInt(msg.cheapestHour) : -1;
-var isCheapestHour = cheapestHourInt >= 0 && currentHourInt === cheapestHourInt && currentPrice <= avgPrice;
+var isCheapestHour = pricesOk && cheapestHourInt >= 0 && currentHourInt === cheapestHourInt && currentPrice <= avgPrice;
 
 var chargeCriticalMax = avgPrice * 0.70;
-if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <= chargeCriticalMax) {
+if (!pricesOk) {
+  isPriceLow = isNegPrice;   // without a price and an average only a negative price counts
+} else if (batterySoC <= CFG.SOC_CRITICAL && currentPrice < avgPrice && currentPrice <= chargeCriticalMax) {
   isPriceLow = true;
-} else if (inChargingWindow === null) {
+} else if (inChargingWindow === null || inChargingWindow === undefined) {
   isPriceLow = isPriceVeryLow || isNegPrice;
 } else {
   isPriceLow = inChargingWindow || isPriceVeryLow || isNegPrice || isCheapestHour;
 }
 
 var isPriceHigh;
-if (msg.inDischargeWindow === true) {
+if (!pricesOk) {
+  isPriceHigh = false;
+} else if (msg.inDischargeWindow === true) {
   isPriceHigh = currentPrice >= avgPrice && currentPrice >= dischargeAbsMin;
 } else {
   isPriceHigh = priceRatio >= dischargeRatioThreshold && currentPrice >= dischargeAbsMin;
 }
 
-var canCharge = batterySoC < CFG.SOC_MAX;
-var canChargeSolar = batterySoC < CFG.SOC_MAX;
-var canDischarge = batterySoC > CFG.SOC_MIN && batterySoC >= CFG.SOC_DISCHARGE_MIN;
+// Without a known SoC or without DSMR data the battery is not controlled at all
+var batteryDataOk = socKnown && metersKnown;
+var canCharge = batteryDataOk && batterySoC < CFG.SOC_MAX;
+var canChargeSolar = batteryDataOk && batterySoC < CFG.SOC_MAX;
+var canDischarge = batteryDataOk && batterySoC > CFG.SOC_MIN && batterySoC >= CFG.SOC_DISCHARGE_MIN;
 
 var solarSurplusThreshold = lastState === 'charging' ? CFG.SOLAR_SURPLUS_EXIT_W : CFG.SOLAR_SURPLUS_W;
-var CONFIRM_CYCLES = (isPriceLow || isPriceHigh || isNegPrice || (actualSurplusW > solarSurplusThreshold && canChargeSolar)) ? 1 : 2;
+// A new state is applied on the second run that asks for it
+var CONFIRM_CYCLES = 2;
 
 var charging = false;
 var discharging = false;
@@ -264,7 +394,8 @@ if (isNegPrice && canCharge) {
     targetAmps = maxAllowedChargeA;
     reason = 'Critical SoC (' + batterySoC + '%) - charging at max ' + targetAmps + ' A (price ' + currentPrice.toFixed(3) + ' EUR below avg ' + avgPrice.toFixed(3) + ' EUR)';
   } else if (inChargingWindow) {
-    targetAmps = Math.round(maxAllowedChargeA * fraction);
+    // The planner sized this window for the full charge rate
+    targetAmps = maxAllowedChargeA;
     reason = 'Planner: cheapest window (' + currentPrice.toFixed(3) + ' EUR) - charging at ' + targetAmps + ' A. Hours: ' + (msg.plannedChargeHours || []).join('h,') + 'h';
   } else {
     targetAmps = Math.round(maxAllowedChargeA * fraction);
@@ -272,27 +403,29 @@ if (isNegPrice && canCharge) {
   }
 
 } else if (actualSurplusW > solarSurplusThreshold && canChargeSolar && !msg.inDischargeWindow) {
-  var surplusAmps = Math.round((actualSurplusW / CFG.BATTERY_VOLTAGE) / CFG.ROUND_TRIP_EFF);
+  // AC surplus → DC amps: the battery receives less than the AC side delivers
+  var surplusAmps = Math.floor((actualSurplusW * CFG.ROUND_TRIP_EFF) / CFG.BATTERY_VOLTAGE);
   charging = true;
   targetAmps = Math.min(CFG.MAX_AMPS, surplusAmps);
   reason = 'Solar surplus ' + actualSurplusW.toFixed(0) + ' W (' + solarTotalW.toFixed(0) + ' W produced) - absorbing at ' + targetAmps + ' A';
 
 } else if (inSolarPreDischargeWindow && canDischarge && batterySoC > solarPreDischargeTargetSoC) {
+  // Spread over the pre-discharge hours that are left (kWh / h = kW)
+  var solarPreHoursCount = (msg.solarPreDischargeHours || []).length || 1;
   var solarPreAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS,
-    Math.round((kwhToFreeForSolar * 1000) / CFG.BATTERY_VOLTAGE)
+    Math.round(((kwhToFreeForSolar / solarPreHoursCount) * 1000) / CFG.BATTERY_VOLTAGE)
   ));
   discharging = true;
   targetAmps = solarPreAmps;
   reason = 'Solar pre-discharge: solar will fill battery before cheap window'
     + ' - discharging ' + targetAmps + ' A'
     + ' (target SoC ' + solarPreDischargeTargetSoC + '%'
-    + ', freeing ' + kwhToFreeForSolar.toFixed(1) + ' kWh for cheap grid charging)';
+    + ', freeing ' + kwhToFreeForSolar.toFixed(1) + ' kWh over ' + solarPreHoursCount + 'h for cheap grid charging)';
 
-} else if (inPreDischargeWindow && canDischarge) {
+} else if (inPreDischargeWindow && canDischarge && batterySoC > preDischargeTargetSoC) {
   var preDischargeHoursCount = (msg.preDischargeHours || []).length || 1;
-  var currentKwhPD = CFG.BATTERY_KWH * ((batterySoC - CFG.SOC_MIN) / 100);
-  var minKwhPD = CFG.BATTERY_KWH * ((CFG.SOC_DISCHARGE_MIN - CFG.SOC_MIN) / 100);
-  var kwhToDischarge = Math.max(0, currentKwhPD - minKwhPD);
+  // Only down to the level the negative window can refill (set by the planner)
+  var kwhToDischarge = Math.max(0, CFG.BATTERY_KWH * ((batterySoC - preDischargeTargetSoC) / 100));
   var targetKwPD = kwhToDischarge / preDischargeHoursCount;
   var preAmps = Math.round((targetKwPD * 1000) / CFG.BATTERY_VOLTAGE);
   var clampedPreAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, preAmps));
@@ -300,7 +433,7 @@ if (isNegPrice && canCharge) {
   targetAmps = clampedPreAmps;
   reason = 'Pre-discharge: neg price in ' + hoursUntilNegWindow + 'h (' + futureNegHoursCount + ' neg hour(s))'
     + ' - discharging ' + targetAmps + ' A to free ' + kwhToDischarge.toFixed(1) + ' kWh'
-    + ' over ' + preDischargeHoursCount + 'h (SoC ' + batterySoC + '% → ' + CFG.SOC_DISCHARGE_MIN + '%)';
+    + ' over ' + preDischargeHoursCount + 'h (SoC ' + batterySoC + '% → ' + preDischargeTargetSoC + '%)';
 
 } else if (isPriceHigh && canDischarge) {
   if (dischargeTargetW > 0) {
@@ -311,7 +444,7 @@ if (isNegPrice && canCharge) {
     var clampedAmps = Math.max(CFG.MIN_DISCHARGE_A, Math.min(CFG.MAX_AMPS, neededAmps));
     discharging = true;
     targetAmps = clampedAmps;
-    reason = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W gross import' + (exportBias > 0 ? ' + ' + exportBias + ' W export bias' : ' (no bias, solar active)') + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
+    reason = 'High price (' + (priceRatio * 100).toFixed(0) + '% of avg, ' + currentPrice.toFixed(3) + ' EUR) - discharging ' + targetAmps + ' A to cover ' + dischargeTargetW.toFixed(0) + ' W house demand' + (exportBias > 0 ? ' + ' + exportBias + ' W export bias' : ' (no bias, solar active)') + (neededAmps < CFG.MIN_DISCHARGE_A ? ' (raised to minimum ' + CFG.MIN_DISCHARGE_A + ' A)' : '');
   } else if (actualSurplusW > 0) {
     var importOnlyW = Math.max(0, gridImport * 1000 - evChargingW);
     if (importOnlyW > 0) {
@@ -332,7 +465,11 @@ if (isNegPrice && canCharge) {
   }
 
 } else {
-  reason = 'Idle - SoC ' + batterySoC + '%, price ' + currentPrice.toFixed(3) + ' EUR (' + (priceRatio * 100).toFixed(0) + '% of avg), solar ' + solarTotalW.toFixed(0) + ' W, netGrid ' + netGridW.toFixed(0) + ' W | ' + (msg.plannerReason || 'no planner');
+  reason = 'Idle - SoC ' + (socKnown ? batterySoC + '%' : 'unknown') + ', price ' + currentPrice.toFixed(3) + ' EUR (' + (priceRatio * 100).toFixed(0) + '% of avg), solar ' + solarTotalW.toFixed(0) + ' W, netGrid ' + netGridW.toFixed(0) + ' W | ' + (msg.plannerReason || 'no planner');
+}
+
+if (dataNotes.length > 0) {
+  reason += ' [' + dataNotes.join(', ') + (batteryDataOk ? '' : ' — battery held idle') + ']';
 }
 
 if (charging && discharging) { discharging = false; reason += ' [conflict resolved: charge wins]'; }
@@ -375,14 +512,20 @@ var dc_power = discharging ? targetAmps * CFG.BATTERY_VOLTAGE : 0;
 
 // ── Hard stop — enforced just before output ───────────────────────────────────
 // If SoC >= 97% force dc_amps to 0 regardless of what any branch decided.
-if (batterySoC >= 97) {
+// Charging is already refused from SOC_MAX (95%); this is the last line of defence.
+var hardStopped = false;
+if (socKnown && batterySoC >= 97 && (charging || dc_amps > 0)) {
   dc_amps = 0;
   charging = false;
+  hardStopped = true;
   reason = 'HARD STOP: SoC ' + batterySoC + '% >= 97% — charging blocked to protect battery';
 }
 
-// Persist the state actually sent to the inverter (after confirmation + hard stop)
+// Persist the state and the setpoints actually sent to the inverter
+// (after confirmation + hard stop) — used for the own-power add-back next run
 context.set('lastState', charging ? 'charging' : discharging ? 'discharging' : 'idle');
+context.set('lastDcAmps', dc_amps);
+context.set('lastDcPower', dc_power);
 
 msg.payload = {
   version: EMS_VERSION + ' / Planner ' + (msg.plannerVersion || 'unknown'),
@@ -394,7 +537,7 @@ msg.payload = {
   planner: {
     inWindow: msg.inChargingWindow,
     inDischargeWindow: msg.inDischargeWindow,
-    dischargeThreshold: msg.dischargeThreshold || null,
+    dischargeThreshold: (msg.dischargeThreshold !== undefined && msg.dischargeThreshold !== null) ? msg.dischargeThreshold : null,
     hoursNeeded: msg.hoursNeeded,
     kwhNeeded: msg.kwhNeeded,
     cheapestPrice: msg.cheapestPrice,
@@ -423,18 +566,24 @@ msg.payload = {
     maxAllowedCharge_A: maxAllowedChargeA,
     evCharging_W: evChargingW,
     evLastAmps: lastEvAmps,
-    evSensorUsed: (msg.EVChargeLoad !== undefined && msg.EVChargeLoad !== null)
+    evSensorUsed: evSensorUsed,
+    priceKnown: priceKnown,
+    avgKnown: avgKnown,
+    socKnown: socKnown,
+    metersKnown: metersKnown,
+    ownChargeAc_W: parseFloat(ownChargeAcW.toFixed(0)),
+    ownDischarge_W: parseFloat(ownDischargeW.toFixed(0))
   },
   timestamp: new Date().toISOString()
 };
 
 node.status({
-  fill: batterySoC >= 97 ? 'yellow' : charging ? 'green' : discharging ? 'red' : 'grey',
+  fill: (hardStopped || !batteryDataOk) ? 'yellow' : charging ? 'green' : discharging ? 'red' : 'grey',
   shape: 'dot',
-  text: batterySoC >= 97 ? 'HARD STOP SoC:' + batterySoC + '%' : EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
+  text: hardStopped ? 'HARD STOP SoC:' + batterySoC + '%' : !batteryDataOk ? EMS_VERSION + ' NO DATA: ' + dataNotes.join(', ') : EMS_VERSION + ' ' + (charging ? 'CHG ' : discharging ? 'DCH ' : 'IDLE ') + targetAmps + 'A | SoC:' + batterySoC + '% | ' + currentPrice.toFixed(3) + 'EUR | solar:' + solarTotalW.toFixed(0) + 'W'
 });
 
-// ── EV Charge Controller v2.21 ────────────────────────────────────────────────
+// ── EV Charge Controller v2.23 ────────────────────────────────────────────────
 //
 // v2.17–v2.19 changes: see file header. Changes in v2.16 (vs v2.15):
 //
@@ -475,6 +624,9 @@ var EV_OVERLOAD_FAST_A = 22;   // react at once above this (3A below the 25A fus
 var EV_HOLD_POLLS = 30;   // ~15 min hold after a trim or soft cut
 var EV_1PH = CFG.EV_1PHASE_GRID_PHASE;
 var EV_1PH_LABEL = 'single-phase-L' + EV_1PH;
+var EV_TRIM_MARGIN_A = 0.5;   // extra room below the 20A limit after a trim
+var EV_POLL_MS = 30 * 1000;   // one "poll" in the *_POLLS settings = 30 s of elapsed time
+var EV_MIN_STEP_UP_MS = 60 * 1000;   // a step up is sent at most once per minute
 var EV_SOC_PRIORITY_ON = 55;   // EV SoC below this → priority charging
 var EV_SOC_PRIORITY_OFF = 60;   // priority ends at or above this (hysteresis)
 var EV_LOW_SOC_MAX = 12;   // max amps per phase during priority charging
@@ -484,6 +636,13 @@ var evCutCooldown = context.get('evCutCooldown') || 0;
 var evRampClearCount = context.get('evRampClearCount') || 0;
 var l1OverloadCount = context.get('l1OverloadCount') || 0;
 var evFinishedCooldown = context.get('evFinishedCooldown') || 0;
+
+// Elapsed time since the previous run, in polls of 30 s. The ramp, the overload
+// hold, the cut cooldown and the nudge cooldown count this instead of runs, so
+// they last equally long whether the flow fires every 5 s or every 5 min.
+var evLastPollMs = context.get('evLastPollMs') || 0;
+var evDtPolls = evLastPollMs > 0 ? Math.max(0, Math.min(10, (nowMs - evLastPollMs) / EV_POLL_MS)) : 1;
+context.set('evLastPollMs', nowMs);
 
 // ── Battery charge hold-down ──────────────────────────────────────────────────
 var EV_CHARGE_HOLDDOWN_CYCLES = 4;
@@ -526,7 +685,7 @@ context.set('evOverPrev', anyOver20);
 var overConfirmed = evCarConnected && (maxPhaseLoad > EV_OVERLOAD_FAST_A || (anyOver20 && evOverPrev));
 var overExcessA = Math.max(0, maxPhaseLoad - EV_L1_HARD_LIMIT);
 var evPhaseLoadA = [phaseL1LoadA, phaseL2LoadA, phaseL3LoadA][EV_1PH - 1];
-var trimAmps = lastEvAmps - Math.ceil(overExcessA);
+var trimAmps = lastEvAmps - Math.ceil(overExcessA + EV_TRIM_MARGIN_A);
 var evTrim = overConfirmed && evIn3Phase && trimAmps >= EV_3PHASE_MIN_A;
 var l1SoftCut = overConfirmed && lastEvAmps > EV_MIN_AMPS && !evTrim;
 var l1SessionCut = overConfirmed && lastEvAmps <= EV_MIN_AMPS && evPhaseLoadA > EV_L1_HARD_LIMIT;
@@ -542,7 +701,7 @@ if (!evCarConnected || l1SessionCut) {
 } else if (l1SoftCut) {
   evHoldPolls = EV_HOLD_POLLS; evHoldAmps = EV_MIN_AMPS; evHoldMode = EV_1PH_LABEL;
 } else if (evHoldPolls > 0) {
-  evHoldPolls--;
+  evHoldPolls = Math.max(0, evHoldPolls - evDtPolls);
 }
 context.set('evHoldPolls', evHoldPolls);
 context.set('evHoldAmps', evHoldAmps);
@@ -574,12 +733,12 @@ if (l1SessionCut) {
   evCutCooldown = EV_CUT_COOLDOWN_POLLS;
   evRampClearCount = 0;
 } else if (inCutCooldown) {
-  evCutCooldown--;
+  evCutCooldown = Math.max(0, evCutCooldown - evDtPolls);
   evRampClearCount = 0;
 } else if (l1SoftCut || evTrim || inEvHold || !evCarConnected) {
   evRampClearCount = 0;   // also during an overload hold and while no car is connected
 } else {
-  evRampClearCount++;
+  evRampClearCount += evDtPolls;
 }
 context.set('evCutCooldown', evCutCooldown);
 context.set('evRampClearCount', evRampClearCount);
@@ -642,7 +801,9 @@ if (l1SessionCut || inCutCooldown) {
 } else if (allow3Phase) {
   var maxAllowed;
   if (evInNight) {
-    var rampBase = Math.max(EV_MIN_AMPS, lastEvAmps);
+    // Night: start at 8A 3-phase, +1A per earned ramp window, max 12A — always
+    // limited by the phase headroom below
+    var rampBase = Math.max(EV_NIGHT_MIN, lastEvAmps);
     var rampBonus = evRampClearCount >= EV_RAMP_UP_POLLS ? 1 : 0;   // max +1A per earned window
     maxAllowed = Math.min(EV_NIGHT_MAX, rampBase + rampBonus);
   } else if (evLowSoc) {
@@ -652,7 +813,7 @@ if (l1SessionCut || inCutCooldown) {
     maxAllowed = Math.min(EV_LOW_SOC_MAX, rampBase4 + rampBonus4);
   } else if (charging || evInHoldDown) {
     maxAllowed = EV_MIN_AMPS;
-  } else if (!charging && currentPrice <= 0) {
+  } else if (!charging && priceKnown && currentPrice <= 0) {
     var rampBase2 = Math.max(EV_MIN_AMPS, lastEvAmps);
     var rampBonus2 = evRampClearCount >= EV_RAMP_UP_POLLS ? 1 : 0;
     maxAllowed = Math.min(EV_NIGHT_MAX, rampBase2 + rampBonus2);
@@ -667,9 +828,10 @@ if (l1SessionCut || inCutCooldown) {
   }
 
   var candidate3 = Math.min(maxAllowed, Math.floor(worst3PhaseA));
-  // Priority charging moves up from single-phase only with >= 8A headroom on every
-  // phase (stays 3-phase down to 7A) — avoids flapping between 1 and 3 phases
-  if (evLowSoc && !evInNight && !evIn3Phase && Math.floor(worst3PhaseA) < EV_NIGHT_MIN) {
+  // Night and priority charging move up from single-phase only with >= 8A headroom
+  // on every phase (and stay 3-phase down to 7A) — avoids flapping between 1 and 3
+  // phases, and the 8A start can never push a phase over the limit
+  if ((evLowSoc || evInNight) && !evIn3Phase && Math.floor(worst3PhaseA) < EV_NIGHT_MIN) {
     candidate3 = 0;
   }
   if (candidate3 >= EV_3PHASE_MIN_A) {
@@ -681,26 +843,23 @@ if (l1SessionCut || inCutCooldown) {
   }
   evCanCharge = true;
 
-  if (evInNight && evSafeAmps < EV_NIGHT_MIN) {
-    evSafeAmps = EV_NIGHT_MIN;
-    evPhaseMode = '3-phase';
-  }
-
 } else {
   if (hasSolarSurplus && solarSurplusL1A + evCurrentPerPhase > EV_MIN_AMPS && !evInNight) {
     evSafeAmps = Math.min(EV_3PHASE_MIN_A - 1, solarSurplusL1A + evCurrentPerPhase);
     evSafeAmps = Math.max(EV_MIN_AMPS, evSafeAmps);
     evPhaseMode = EV_1PH_LABEL;  // no 3-phase headroom — solar on the single phase only
     evCanCharge = true;
-  } else if (evInNight) {
-    evSafeAmps = EV_NIGHT_MIN;
-    evPhaseMode = '3-phase';
-    evCanCharge = true;
   } else {
     evSafeAmps = EV_MIN_AMPS;
     evPhaseMode = EV_1PH_LABEL;
     evCanCharge = true;
   }
+}
+
+// ── No DSMR data — phase loads unknown, stay at the single-phase baseline ────
+if (!metersKnown && !l1SessionCut && !inCutCooldown) {
+  evSafeAmps = EV_MIN_AMPS;
+  evPhaseMode = EV_1PH_LABEL;
 }
 
 // ── Overload hold — cap at the held level, night minimum suppressed ──────────
@@ -746,7 +905,7 @@ if (!evCarConnected) {
 } else if (inCutCooldown) {
   evTargetAmps = 5;
   evPhaseMode = EV_1PH_LABEL;
-  evReason = 'Post-cut cooldown (' + evCutCooldown + ' polls remaining) — EV at min 5A';
+  evReason = 'Post-cut cooldown (' + Math.ceil(evCutCooldown) + ' polls remaining) — EV at min 5A';
 
 } else if (evTrim) {
   evTargetAmps = trimAmps;
@@ -770,15 +929,14 @@ if (!evCarConnected) {
     evTargetAmps = EV_MIN_AMPS;
     evPhaseMode = EV_1PH_LABEL;
   } else if (charging && evInNight && !evLowSoc) {
-    evTargetAmps = Math.min(8, evSafeAmps);
-    evPhaseMode = '3-phase';
+    evTargetAmps = Math.min(8, evSafeAmps);   // phase mode as determined above
   } else {
     evTargetAmps = evSafeAmps;
   }
 
   if (evInNight && evPhaseMode === '3-phase') {
     evReason = 'Night charging (' + currentPrice.toFixed(3) + ' EUR) - ' + evTargetAmps + 'A [3-phase, max ' + EV_NIGHT_MAX + 'A]'
-      + ' ramp=' + evRampClearCount + '/' + EV_RAMP_UP_POLLS
+      + ' ramp=' + Math.floor(evRampClearCount) + '/' + EV_RAMP_UP_POLLS
       + ' (headroom: L1=' + l1HeadroomA.toFixed(0) + ' L2=' + l2HeadroomA.toFixed(0) + ' L3=' + l3HeadroomA.toFixed(0) + ')';
   } else if (evPhaseMode === '3-phase') {
     evReason = 'Charging ' + evTargetAmps + 'A [3-phase] (headroom: worst=' + Math.floor(worst3PhaseA) + 'A)';
@@ -792,7 +950,7 @@ if (!evCarConnected) {
   } else if (discharging && !evInNight) {
     evReason += ' — battery discharging, capped at 6A baseline';
   } else if (charging && evInNight) {
-    evReason += ' — battery charging, night cap 8A 3-phase';
+    evReason += ' — battery charging, night cap 8A';
   } else if (inChargingWindow && currentPrice <= chargeAbsMax) {
     evReason += ' — cheap price window (' + currentPrice.toFixed(3) + ' EUR)';
   } else if (isPriceVeryLow) {
@@ -803,13 +961,24 @@ if (!evCarConnected) {
     evReason += ' — baseline (' + currentPrice.toFixed(3) + ' EUR)';
   }
   if (inEvHold) {
-    evReason += ' [overload hold: ' + evHoldPolls + ' polls left]';
+    evReason += ' [overload hold: ' + Math.ceil(evHoldPolls) + ' polls left]';
+  }
+  if (!metersKnown) {
+    evReason += ' [DSMR data unknown — 6A baseline]';
   }
   if (evCarFull) {
     evReason += ' [Zaptec: finished, car full ' + evSoC + '% — current kept available]';
   } else if (zaptecMode === 'connected_finished') {
     evReason += ' [Zaptec: finished, SoC ' + (evSoCKnown ? evSoC + '%' : 'unknown') + ']';
   }
+}
+
+// ── Step-up spacing ───────────────────────────────────────────────────────────
+// Steps down are always sent at once. A step up within EV_MIN_STEP_UP_MS of the
+// previous write waits for a later run (not the first command of a session).
+if (evCarConnected && lastEvAmps > 0 && evTargetAmps > lastEvAmps && evTimeSince < EV_MIN_STEP_UP_MS) {
+  evReason += ' [step up to ' + evTargetAmps + 'A waits, last write ' + Math.round(evTimeSince / 1000) + ' s ago]';
+  evTargetAmps = lastEvAmps;
 }
 
 // ── Step-up lock ──────────────────────────────────────────────────────────────
@@ -841,7 +1010,7 @@ var evSessionKwh = context.get('evSessionKwh') || 0;
 var evSessionCostAct = context.get('evSessionCostAct') || 0;
 var evSessionCostPub = context.get('evSessionCostPub') || 0;
 
-var evChargingNowW = parseFloat(msg.EVChargeLoad) || 0;
+var evChargingNowW = evSensorUsed ? evLoadRaw : 0;   // measured load only
 if (evCarConnected && evChargingNowW > 0 && evCycleSeconds > 0 && evCycleSeconds < 300) {
   var evCycleKwh = (evChargingNowW / 1000) * (evCycleSeconds / 3600);
   evSessionKwh += evCycleKwh;
@@ -870,7 +1039,7 @@ if (evCarConnected && zaptecMode === 'connected_finished' && !evCarFull) {   // 
     evFinishedNudges++;
     evFinishedCooldown = EV_FINISHED_COOLDOWN;
   } else if (evFinishedCooldown > 0) {
-    evFinishedCooldown--;
+    evFinishedCooldown = Math.max(0, evFinishedCooldown - evDtPolls);
   }
 } else {
   evFinishedCooldown = 0;
@@ -930,12 +1099,13 @@ var evMsg = {
       evSoC: evSoC,
       overConfirmed: overConfirmed,
       inEvHold: inEvHold,
-      evHoldPolls: evHoldPolls,
+      evHoldPolls: Math.ceil(evHoldPolls),
       inCutCooldown: inCutCooldown,
-      evCutCooldown: evCutCooldown,
-      evRampClearCount: evRampClearCount,
+      evCutCooldown: Math.ceil(evCutCooldown),
+      evRampClearCount: Math.floor(evRampClearCount),
+      metersKnown: metersKnown,
       evJustFinished: evJustFinished,
-      evFinishedCooldown: evFinishedCooldown,
+      evFinishedCooldown: Math.ceil(evFinishedCooldown),
       evFinishedNudges: evFinishedNudges,
       evInHoldDown: evInHoldDown,
       holdDownCount: holdDownCount,
@@ -960,6 +1130,7 @@ var evMsg = {
   evTargetAmps: evTargetAmps,
   evCharging: evCharging,
   evShouldWrite: evShouldWriteZaptec,
+  evCanCharge: evCanCharge,   // false during a session cut / cooldown — for a switch node that pauses the charger
   zaptecValue: parseFloat(evTargetAmps),
   evSessionKwh: parseFloat(evSessionKwh.toFixed(3)),
   evSessionCostAct: parseFloat(evSessionCostAct.toFixed(4)),
